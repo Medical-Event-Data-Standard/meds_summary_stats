@@ -29,6 +29,34 @@ class Severity(enum.StrEnum):
         True
         >>> sorted([Severity.ERROR, Severity.INFO, Severity.WARNING])
         [<Severity.INFO: 'info'>, <Severity.WARNING: 'warning'>, <Severity.ERROR: 'error'>]
+
+        Severity *strings* compare by seriousness too, which matters because this is a ``StrEnum``
+        and callers naturally reach for the string form. Left to the base class these would compare
+        alphabetically and answer wrongly -- ``"error" < "warning"``, so ``Severity.ERROR >
+        "warning"`` would be ``False``:
+
+        >>> Severity.ERROR > "warning", Severity.INFO > "warning"
+        (True, False)
+        >>> Severity.WARNING >= "warning", Severity.WARNING <= "info"
+        (True, False)
+
+        A string that is not a severity at all is a mistake, and says so:
+
+        >>> Severity.ERROR > "banana"
+        Traceback (most recent call last):
+            ...
+        ValueError: 'banana' is not a valid Severity
+
+        As is comparing against a non-string:
+
+        >>> Severity.ERROR < 3
+        Traceback (most recent call last):
+            ...
+        TypeError: '<' not supported between instances of 'Severity' and 'int'
+        >>> Severity.ERROR >= None
+        Traceback (most recent call last):
+            ...
+        TypeError: '>=' not supported between instances of 'Severity' and 'NoneType'
     """
 
     INFO = "info"
@@ -39,29 +67,39 @@ class Severity(enum.StrEnum):
     def _rank(self) -> int:
         return ["info", "warning", "error"].index(self.value)
 
+    @staticmethod
+    def _rank_of(other: object) -> int | None:
+        """Rank whatever we are being compared against, or ``None`` if it is not a severity.
+
+        Severity strings are accepted and ranked by seriousness. Without this, the ``StrEnum`` base
+        would quietly answer with an *alphabetical* comparison -- ``Severity.ERROR > "warning"``
+        would be ``False``, because ``"e" < "w"`` -- which is a wrong answer rather than an error.
+        """
+        if isinstance(other, Severity):
+            return other._rank
+        if isinstance(other, str):
+            return Severity(other)._rank
+        return None
+
     def __lt__(self, other: object) -> bool:
         """Order by seriousness, so that ``max()`` over findings yields the worst one."""
-        if not isinstance(other, Severity):
-            return NotImplemented
-        return self._rank < other._rank
+        rank = self._rank_of(other)
+        return NotImplemented if rank is None else self._rank < rank
 
     def __gt__(self, other: object) -> bool:
         """Order by seriousness."""
-        if not isinstance(other, Severity):
-            return NotImplemented
-        return self._rank > other._rank
+        rank = self._rank_of(other)
+        return NotImplemented if rank is None else self._rank > rank
 
     def __le__(self, other: object) -> bool:
         """Order by seriousness."""
-        if not isinstance(other, Severity):
-            return NotImplemented
-        return self._rank <= other._rank
+        rank = self._rank_of(other)
+        return NotImplemented if rank is None else self._rank <= rank
 
     def __ge__(self, other: object) -> bool:
         """Order by seriousness."""
-        if not isinstance(other, Severity):
-            return NotImplemented
-        return self._rank >= other._rank
+        rank = self._rank_of(other)
+        return NotImplemented if rank is None else self._rank >= rank
 
 
 class Kind(enum.StrEnum):
@@ -176,6 +214,14 @@ class Rule:
             Traceback (most recent call last):
                 ...
             ValueError: Every rule needs a 'path'
+
+            A misspelled key is rejected rather than ignored -- a silently dropped ``errors`` would
+            leave the rule unable to fire while looking correct:
+
+            >>> Rule.from_dict({"path": "a.*", "kind": "relative", "errors": 0.1})
+            Traceback (most recent call last):
+                ...
+            ValueError: Unknown rule keys for path 'a.*': ['errors']
         """
         if "path" not in raw:
             raise ValueError("Every rule needs a 'path'")

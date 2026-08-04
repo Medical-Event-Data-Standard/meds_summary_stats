@@ -133,6 +133,26 @@ def render_text(report: ComparisonReport, max_per_severity: int = DEFAULT_MAX_PE
           codes.digests.by_subject_frequency
               changed from 'sha256:aaa' to 'sha256:bbb'
 
+        Long finding lists are truncated per severity, with the remainder counted rather than
+        silently dropped:
+
+        >>> many = ComparisonReport(
+        ...     status="warn", failed=False, fail_on="error", n_paths_checked=99, n_paths_ignored=0,
+        ...     dataset_version_changed=False, relaxed=False,
+        ...     findings=tuple(
+        ...         Finding(path=f"codes.digests.d{i}", severity=Severity.WARNING, kind="exact",
+        ...                 message="changed")
+        ...         for i in range(5)))
+        >>> print(render_text(many, max_per_severity=2))
+        WARN - 99 paths checked, 0 ignored; 5 warning.
+        <BLANKLINE>
+        WARNING (5)
+          codes.digests.d0
+              changed
+          codes.digests.d1
+              changed
+          ... and 3 more
+
         A relaxed run says so, since a reader would otherwise wonder why large drifts passed:
 
         >>> relaxed = ComparisonReport(status="pass", failed=False, fail_on="error", findings=(),
@@ -208,6 +228,43 @@ def render_markdown(report: ComparisonReport, max_per_severity: int = DEFAULT_MA
         | Path | Baseline | Current | Detail |
         | --- | --- | --- | --- |
         | `counts.n_subjects` | 100000 | 98000 | over threshold |
+
+        Truncation and the verdict note both carry through to markdown:
+
+        >>> many = ComparisonReport(
+        ...     status="fail", failed=False, fail_on="never", n_paths_checked=9, n_paths_ignored=0,
+        ...     dataset_version_changed=False, relaxed=False,
+        ...     findings=tuple(
+        ...         Finding(path=f"p{i}", severity=Severity.ERROR, kind="exact", message="changed")
+        ...         for i in range(3)))
+        >>> print(render_markdown(many, max_per_severity=1), end="")
+        ## ❌ MEDS summary-stats comparison: fail
+        <BLANKLINE>
+        9 paths checked, 0 ignored. **3 errors**, 0 warnings, 0 info.
+        <BLANKLINE>
+        ### Errors (3)
+        <BLANKLINE>
+        | Path | Baseline | Current | Detail |
+        | --- | --- | --- | --- |
+        | `p0` | - | - | changed |
+        | _… and 2 more_ | | | |
+        <BLANKLINE>
+        > [!NOTE]
+        > Errors were found, but fail_on=never, so the run is not failed.
+
+        A relaxed run is called out in markdown too, so a reader of a green job summary can see why
+        large drifts did not fail it:
+
+        >>> relaxed = ComparisonReport(status="pass", failed=False, fail_on="error", findings=(),
+        ...                            n_paths_checked=7, n_paths_ignored=0,
+        ...                            dataset_version_changed=True, relaxed=True)
+        >>> print(render_markdown(relaxed), end="")
+        ## ✅ MEDS summary-stats comparison: pass
+        <BLANKLINE>
+        7 paths checked, 0 ignored. No findings.
+        <BLANKLINE>
+        > [!NOTE]
+        > `dataset_version` changed, so numeric findings were downgraded to informational.
     """
     counts = report.counts
     icon = _STATUS_ICON.get(report.status, "❔")

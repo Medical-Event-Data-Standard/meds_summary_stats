@@ -347,6 +347,12 @@ def _dataset_version_finding(
         >>> policy = ComparePolicy.from_dict({"on_dataset_version_change": "relax"})
         >>> _dataset_version_finding(base, curr, policy).severity
         <Severity.INFO: 'info'>
+
+        Under ``ignore`` the change is not reported at all:
+
+        >>> ignoring = ComparePolicy.from_dict({"on_dataset_version_change": "ignore"})
+        >>> _dataset_version_finding(base, curr, ignoring) is None
+        True
     """
     before = (baseline.get("dataset") or {}).get("dataset_version")
     after = (current.get("dataset") or {}).get("dataset_version")

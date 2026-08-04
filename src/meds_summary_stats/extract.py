@@ -710,6 +710,13 @@ def _code_vocabulary_map(meds_dir: Path) -> pl.LazyFrame | None:
         >>> with yaml_disk({"data": {}}) as d:
         ...     _code_vocabulary_map(d) is None
         True
+
+        Code metadata without a ``parent_codes`` column carries no ontology linkage, so there is
+        nothing to map:
+
+        >>> with yaml_disk({"metadata": {"codes.parquet": {"code": ["HR"]}}}) as d:
+        ...     _code_vocabulary_map(d) is None
+        True
     """
     fp = meds_dir / meds.code_metadata_filepath
     if not fp.is_file():
@@ -1075,6 +1082,29 @@ def _ontology_block(
         >>> with yaml_disk({"data": {}}) as d:
         ...     _ontology_block(d, None, None, set(), None, ExtractConfig())
         {'present': False}
+
+        As does code metadata that exists but declares no ``parent_codes`` column:
+
+        >>> with yaml_disk({"metadata": {"codes.parquet": {"code": ["HR"]}}}) as d:
+        ...     _ontology_block(d, None, None, {"HR"}, 10, ExtractConfig())
+        {'present': False}
+
+        With ``emit_ontology_keys``, each reported vocabulary also lists its keys in full. Those
+        name published terminology concepts, so this is off by default for output size rather than
+        for privacy:
+
+        >>> spec = {"metadata": {"codes.parquet": {
+        ...     "code": ["HR"], "parent_codes": [["LOINC/8867-4", "LOINC/8310-5"]],
+        ... }}}
+        >>> volumes = pl.DataFrame([{"vocabulary": "LOINC", "n_measurements": 500,
+        ...                          "n_subjects": 50, "n_child_codes": 1,
+        ...                          "numeric_n_finite": 0, "numeric_mean": None,
+        ...                          "numeric_std": None}])
+        >>> with yaml_disk(spec) as d:
+        ...     keyed = _ontology_block(d, volumes, None, {"HR"}, 500,
+        ...                             ExtractConfig(min_cell_size=20, emit_ontology_keys=True))
+        >>> keyed["by_vocabulary"]["LOINC"]["keys"]
+        ['8310-5', '8867-4']
     """
     fp = meds_dir / meds.code_metadata_filepath
     if not fp.is_file():
