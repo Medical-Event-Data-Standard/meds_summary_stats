@@ -1,0 +1,124 @@
+# Exercises `action.yml` against itself.
+#
+# A composite action is not covered by the Python test suite: its shell, its argument threading, and
+# its output wiring only run in Actions. This workflow builds a throwaway MEDS dataset, runs the
+# action in extract-only mode to produce a baseline, then runs it again in comparison mode -- once
+# where it must pass and once, against a deliberately corrupted baseline, where it must fail.
+
+name: Action self-test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup package
+        uses: ./.github/actions/setup
+        with:
+          python-version: "3.12"
+
+      - name: Build a throwaway MEDS dataset
+        run: |
+          uv run build_sample_MEDS_dataset \
+            seed=1 N_subjects=200 do_overwrite=False \
+            output_dir=sample_dataset dataset_spec/data_generator=sample
+
+      - name: Extract a baseline
+        id: baseline
+        uses: ./
+        with:
+          meds-dir: sample_dataset
+          output: baseline.json
+          package-spec: .
+          upload-artifacts: "false"
+
+      - name: Baseline was produced
+        env:
+          STATS_PATH: ${{ steps.baseline.outputs.stats-path }}
+        run: test -s "$STATS_PATH"
+
+      - name: Compare against the baseline (must pass)
+        id: clean
+        uses: ./
+        with:
+          meds-dir: sample_dataset
+          baseline: baseline.json
+          output: current.json
+          package-spec: .
+          artifact-name: selftest-clean
+
+      - name: Comparison reported a pass
+        env:
+          STATUS: ${{ steps.clean.outputs.status }}
+          FAILED: ${{ steps.clean.outputs.failed }}
+        run: |
+          echo "status=$STATUS failed=$FAILED"
+          test "$STATUS" = "pass"
+          test "$FAILED" = "false"
+
+      - name: Corrupt the baseline
+        run: |
+          uv run python -c "
+          import json, pathlib
+          p = pathlib.Path('corrupted.json')
+          stats = json.loads(pathlib.Path('baseline.json').read_text())
+          stats['counts']['n_subjects'] = int(stats['counts']['n_subjects'] * 0.5)
+          p.write_text(json.dumps(stats))
+          "
+
+      - name: Compare against the corrupted baseline (must fail)
+        id: dirty
+        continue-on-error: true
+        uses: ./
+        with:
+          meds-dir: sample_dataset
+          baseline: corrupted.json
+          output: current2.json
+          report: report2.json
+          markdown: report2.md
+          package-spec: .
+          artifact-name: selftest-dirty
+
+      - name: Regression was detected and failed the step
+        env:
+          OUTCOME: ${{ steps.dirty.outcome }}
+          STATUS: ${{ steps.dirty.outputs.status }}
+        run: |
+          echo "outcome=$OUTCOME status=$STATUS"
+          test "$OUTCOME" = "failure"
+          test "$STATUS" = "fail"
+          grep -q "counts.n_subjects" report2.json
+
+      - name: fail-on never reports the regression without failing
+        id: advisory
+        uses: ./
+        with:
+          meds-dir: sample_dataset
+          baseline: corrupted.json
+          output: current3.json
+          report: report3.json
+          markdown: report3.md
+          fail-on: never
+          package-spec: .
+          artifact-name: selftest-advisory
+
+      - name: Advisory mode still reports the failure status
+        env:
+          STATUS: ${{ steps.advisory.outputs.status }}
+          FAILED: ${{ steps.advisory.outputs.failed }}
+        run: |
+          test "$STATUS" = "fail"
+          test "$FAILED" = "false"

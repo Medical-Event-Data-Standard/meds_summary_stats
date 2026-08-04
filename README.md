@@ -1,196 +1,425 @@
-# MHAL-template
+# meds_summary_stats
 
-[![Python 3.12+](https://img.shields.io/badge/-Python_3.12+-blue?logo=python&logoColor=white)](https://www.python.org/downloads/release/python-3100/)
-[![PyPI - Version](https://img.shields.io/pypi/v/package_name)](https://pypi.org/project/package_name/)
-[![Documentation Status](https://readthedocs.org/projects/package_name/badge/?version=latest)](https://package_name.readthedocs.io/en/latest/?badge=latest)
-[![Tests](https://github.com/McDermottHealthAI/MHAL-template/actions/workflows/tests.yaml/badge.svg)](https://github.com/McDermottHealthAI/MHAL-template/actions/workflows/tests.yaml)
-[![Test Coverage](https://codecov.io/github/McDermottHealthAI/MHAL-template/graph/badge.svg?token=BV119L5JQJ)](https://codecov.io/github/McDermottHealthAI/MHAL-template)
-[![Code Quality](https://github.com/McDermottHealthAI/MHAL-template/actions/workflows/code-quality-main.yaml/badge.svg)](https://github.com/McDermottHealthAI/MHAL-template/actions/workflows/code-quality-main.yaml)
-[![Contributors](https://img.shields.io/github/contributors/McDermottHealthAI/MHAL-template.svg)](https://github.com/McDermottHealthAI/package_name/graphs/contributors)
-[![Pull Requests](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/McDermottHealthAI/package_name/pulls)
-[![License](https://img.shields.io/badge/License-MIT-green.svg?labelColor=gray)](https://github.com/McDermottHealthAI/package_name#license)
+[![Python 3.12+](https://img.shields.io/badge/-Python_3.12+-blue?logo=python&logoColor=white)](https://www.python.org/downloads/)
+[![PyPI - Version](https://img.shields.io/pypi/v/meds_summary_stats)](https://pypi.org/project/meds_summary_stats/)
+[![Tests](https://github.com/Medical-Event-Data-Standard/meds_summary_stats/actions/workflows/tests.yaml/badge.svg)](https://github.com/Medical-Event-Data-Standard/meds_summary_stats/actions/workflows/tests.yaml)
+[![Code Quality](https://github.com/Medical-Event-Data-Standard/meds_summary_stats/actions/workflows/code-quality-main.yaml/badge.svg)](https://github.com/Medical-Event-Data-Standard/meds_summary_stats/actions/workflows/code-quality-main.yaml)
+[![Contributors](https://img.shields.io/github/contributors/Medical-Event-Data-Standard/meds_summary_stats.svg)](https://github.com/Medical-Event-Data-Standard/meds_summary_stats/graphs/contributors)
+[![Pull Requests](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/Medical-Event-Data-Standard/meds_summary_stats/pulls)
+[![License](https://img.shields.io/badge/License-MIT-green.svg?labelColor=gray)](https://github.com/Medical-Event-Data-Standard/meds_summary_stats#license)
 
-A minimal python package/project template for McDermott Health AI Lab research projects.
+Fast, privacy-safe summary statistics over [MEDS](https://github.com/Medical-Event-Data-Standard/meds)
+datasets, for validating ETLs and catching regressions in them over time.
 
-## Quick Setup
+You ship a new version of an ETL. The dataset version has not changed, so the subject count should
+not have moved, the schema should be identical, and the code vocabulary should be the same set of
+strings. This tool turns that expectation into a file you can commit and a check you can run in CI.
 
-This template contains the following files:
+> [!WARNING]
+> Under active initial development. The stats surface and comparison semantics are not yet stable;
+> pin a version.
+
+## Two commands
+
+```bash
+# Reduce a dataset to a small, aggregated, non-sensitive fingerprint.
+extract_MEDS_summary_stats /data/mimic-iv-meds -o baseline.json
+
+# ... later, after an ETL change ...
+extract_MEDS_summary_stats /data/mimic-iv-meds -o current.json
+
+# Diff the two against a tolerance policy. Exit code 1 if it regressed.
+compare_MEDS_summary_stats baseline.json current.json
+```
+
+Both are also `python -m meds_summary_stats extract` / `... compare`, and both are importable
+(`extract_summary_stats`, `compare_summary_stats`).
+
+## A worked example
+
+Three complete MEDS datasets are committed under [`examples/datasets/`](examples/datasets), so
+everything below runs against a fresh clone with no setup. Every output on this page is executed as
+a doctest, so it is what the tool actually prints.
 
 ```python
->>> print_directory(
-...     Path("."),
-...     config=PrintConfig(ignore_regex=(
-...         "^(\\.git|.*\\.gitkeep|\\.venv|\\.pytest_cache|.*__pycache__|.*\\.egg-info"
-...         "|node_modules|\\.ruff_cache|\\.claude"
-...         ")$"
-...     ))
-... )
-├── .github
-│   ├── actions
-│   │   └── setup
-│   │       └── action.yaml
-│   ├── dependabot.yml
-│   ├── workflows
-│   │   ├── code-quality-main.yaml
-│   │   ├── code-quality-pr.yaml
-│   │   ├── python-build.yaml
-│   │   └── tests.yaml
-│   └── zizmor.yml
-├── .gitignore
-├── .pre-commit-config.yaml
-├── .python-version
-├── AGENTS.md
-├── CLAUDE.md
-├── CONTRIBUTORS.md
-├── LICENSE
-├── README.md
-├── conftest.py
-├── pyproject.toml
-├── src
-│   └── package_name
-│       └── __init__.py
-├── tests
-└── uv.lock
+>>> print_directory(EXAMPLES / "datasets" / "v1_baseline")
+├── data
+│   ├── held_out
+│   │   └── 0.parquet
+│   ├── train
+│   │   └── 0.parquet
+│   └── tuning
+│       └── 0.parquet
+└── metadata
+    ├── codes.parquet
+    ├── dataset.json
+    └── subject_splits.parquet
 
 ```
 
-Many of these files are standard, and others are less so. See below for some explanation of these files.
+160 subjects, 2258 measurements, a ten-code vocabulary — half of it mapped into LOINC, ICD10CM, and
+SNOMED via `parent_codes`, half unmapped. [`examples/build_datasets.py`](examples/build_datasets.py)
+is the readable source of truth for what is in them.
 
-To use this template, simply click the "Use this template" button above to create a new repository initialized
-from this repository; next, you will need to change the following aspects of the new repository:
+### 1. Extract a baseline
 
-- Rename the `package_name` directory in `src/` to your desired package name.
-- Update the `pyproject.toml` file with your package name, author information, and other metadata.
-- Update the `README.md` file to point to the correct badge links for your new repository, then update the
-    rest of the file with information relevant to your project. You will want to find and replace both
-    `package_name` and `MHAL-template` with your new package / repository name.
-- Set-up trusted publishing on PyPI for your new package name pointing to the output repository.
-- Set-up appropriate tokens for CodeCov or other services (if necessary) within your repository.
-- Optionally, update the `LICENSE`, `CONTRIBUTING.md`, and `AGENTS.md` files with information relevant to
-    your project.
-- Update `AGENTS.md` with any project-specific conventions (e.g., domain-specific naming rules,
-    special test fixtures, or additional build steps). Update the `known-first-party` value in the
-    `[tool.ruff.lint.isort]` section of `pyproject.toml`.
+```bash
+extract_MEDS_summary_stats examples/datasets/v1_baseline -o examples/stats/v1_baseline.json
+```
 
-> [!WARNING]
-> Note there is no folder in this repository template for `data` -- this is because _you should not put data in your code repository_. Datasets (public or private) should be stored outside of the repository (even if your repository is private) to avoid risking leakage of sensitive data, unnecessary bloat in your code repository, and over specialization to a particular data resource. Similarly, API keys or other "Secrets" for your project should also not be committed to your `git` repository or pushed to GitHub. Note that this applies to the underlying `git` repository as well as the online `github` -- if something is in your `git` commit history, it can be found through the published repository even if it is not on the main branch; in the event that you accidentally commit data or a secret variable, you need to [purge](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/removing-sensitive-data-from-a-repository) that commit from your `git` history (and/or from your repository) in addition to any other steps you need to take depending on what was added to a repository and/or exposed.
+That fingerprint is committed at [`examples/stats/v1_baseline.json`](examples/stats/v1_baseline.json)
+— 8 KB of JSON, safe to keep in version control next to the ETL that produced it. The headline
+block:
 
-## Documentation
+```python
+>>> from meds_summary_stats.extract import read_summary_stats
+>>> baseline = read_summary_stats(EXAMPLES / "stats" / "v1_baseline.json")
+>>> print(json.dumps(baseline["counts"], indent=2, sort_keys=True))
+{
+  "n_events": 2258,
+  "n_measurements": 2258,
+  "n_static_measurements": 160,
+  "n_subjects": 160,
+  "n_subjects_with_birth": 160,
+  "n_subjects_with_death": 0,
+  "n_subjects_with_static": 160,
+  "n_unique_codes": 10,
+  "numeric": {
+    "mean": 103.9,
+    "n_finite": 1037,
+    "n_infinite": 0,
+    "n_nan": 0,
+    "n_negative": 0,
+    "n_present": 1037,
+    "n_zero": 0,
+    "std": 26.3615
+  },
+  "quality": {
+    "n_empty_code": 0,
+    "n_null_code": 0,
+    "n_null_subject_id": 0
+  }
+}
 
-### Python Build System: `uv`
+```
 
-This project uses [`uv`](https://docs.astral.sh/uv/) as its sole Python package manager. `uv` is a
-fast Rust-based tool from [Astral](https://astral.sh) (the same team behind `ruff`) that replaces
-`pip`, `pip-tools`, `virtualenv`, and `pyenv` with one tool and a single, consistent workflow.
+Splits survive the default suppression floor of 20 subjects, so they are reported by name:
 
-Why we standardize on `uv` across the lab:
+```python
+>>> print(json.dumps(baseline["splits"]["by_split"], indent=2, sort_keys=True))
+{
+  "held_out": {
+    "n_measurements": 315,
+    "n_subjects": 24
+  },
+  "train": {
+    "n_measurements": 1593,
+    "n_subjects": 112
+  },
+  "tuning": {
+    "n_measurements": 350,
+    "n_subjects": 24
+  }
+}
 
-- **Reproducible environments.** `uv.lock` pins exact versions of every transitive dependency, so
-    collaborators and CI install the identical environment.
-- **Fast.** Dependency resolution and installs run in seconds, not minutes.
-- **Modern defaults.** Lockfile-first, `pyproject.toml`-native; `uv` also installs the right Python
-    interpreter for you based on `.python-version`, so you don't need a separate Python-version
-    manager.
-- **One tool, one workflow** across all of our research repos, which keeps onboarding fast.
+```
 
-The shortest path to install `uv` is `curl -LsSf https://astral.sh/uv/install.sh | sh` (Linux/macOS)
-or `brew install uv`. See the [install guide](https://docs.astral.sh/uv/getting-started/installation/)
-for other platforms, and see [`CONTRIBUTORS.md`](CONTRIBUTORS.md#build-system-uv) for the commands
-you'll use day-to-day.
+Re-extracting the same dataset reproduces it exactly, which is the property the whole tool rests on:
 
-### Linting / Code Style
+```python
+>>> from meds_summary_stats.compare import compare_summary_stats
+>>> from meds_summary_stats.report import render_text
+>>> print(render_text(compare_summary_stats(baseline, baseline)))
+PASS - 186 paths checked, 3 ignored, no findings.
 
-For linting and code style we use [`ruff`](https://docs.astral.sh/ruff/) following the
-[Python Google Style Guide](https://google.github.io/styleguide/pyguide.html). Formatting and lint
-fixes happen automatically on commit via [`pre-commit`](https://pre-commit.com/) hooks, configured
-in [`.pre-commit-config.yaml`](.pre-commit-config.yaml). See
-[`CONTRIBUTORS.md`](CONTRIBUTORS.md#code-style) for install steps and the full list of hooks
-(which includes more than just ruff — secret scanning, dependency hygiene, workflow security, etc.).
+```
 
-### Testing
+### 2. A broken ETL, same source data
 
-We use [`pytest`](https://docs.pytest.org/en/stable/) plus
-[`doctest`](https://docs.python.org/3/library/doctest.html), with
-[`pytest-cov`](https://github.com/pytest-dev/pytest-cov) reporting coverage to
-[codecov.io](https://about.codecov.io/) for the README badge and PR-level coverage diffs. Run
-`uv run pytest -v` to execute the full suite locally; see
-[`CONTRIBUTORS.md`](CONTRIBUTORS.md#testing) for the full setup and conventions.
+[`examples/datasets/v1_etl_regression`](examples/datasets/v1_etl_regression) is the *same* source
+data — `dataset_version` still `1.0` — put through an ETL carrying three independent bugs: `TEMP` is
+emitted in Celsius instead of Fahrenheit, `LAB//SODIUM` is silently renamed, and every twentieth
+subject is dropped.
 
-#### Testing Style and Doctests
+```bash
+extract_MEDS_summary_stats examples/datasets/v1_etl_regression -o current.json
+compare_MEDS_summary_stats examples/stats/v1_baseline.json current.json # exit 1
+```
 
-While conventional wisdom in the software engineering community is to avoid doctests, I disagree. I feel that
-doctests are an excellent way (provided appropriate APIs are written, tools are used, and the kinds of tests
-included are appropriate) to ensure that code examples in docstrings and markdown documentation remains
-accurate and reliable. This is especially important in research code, where the audience may be less
-experienced programmers and more likely to copy-paste code examples from documentation. To this end, I
-recommend, in general, writing conventional unit tests that validate a function or class's API as doctests
-wherever possible. If such a test would be excessively long, complex, or unclear, then it should be written as
-a standalone unit test in a `tests/**/test_*.py` file.
+```python
+>>> regressed = read_summary_stats(EXAMPLES / "stats" / "v1_etl_regression.json")
+>>> report = compare_summary_stats(baseline, regressed)
+>>> report.status, report.failed, report.counts
+('fail', True, {'error': 44, 'info': 0, 'warning': 12})
 
-> [!NOTE]
-> Note that when embedding doctests in markdown files, you must still use the `>>>` and `...` prompts, and you
-> must ensure there is a new line separating the final output line from the `\`\`\`\` closing the code block.
-> See above for an example.
+```
 
-Note that you can make doctests much easier to write and read (by omitting common setup or import code) by
-using a [`conftest.py`](conftest.py) file to define common fixtures and add imports to the
-[doctest namespace](https://docs.pytest.org/en/stable/how-to/doctest.html#doctest-namespace-fixture).
-See the linked example for how to enable this functionality.
+All three bugs are caught, each on a path that names the problem:
 
-> [!NOTE]
-> Note that the linked [`conftest.py`](conftest.py) file is located in the root directory, _not_ the root test
-> directory (`tests/`). This is because we want the fixtures and imports to be available to doctests in
-> non-test files (e.g., docstrings in the main package and markdown documentation files).
+```python
+>>> findings = {f.path: f for f in report.findings}
 
-#### Additional Testing Packages
+>>> print(findings["counts.n_subjects"].message)          # dropped subjects
+160 -> 152 (-5.00%), over relative threshold 0.005
 
-Beyond the default packages, you may also want to use:
+>>> findings["codes.digests.alphabetical"].kind           # renamed code
+'exact'
 
-- [`pytest-doctestplus`](https://github.com/scientific-python/pytest-doctestplus) for advanced doctest
-    support.
-- [`hypothesis`](https://hypothesis.readthedocs.io/en/latest/) for property-based testing.
-- [`pretty-print-directory`](https://github.com/mmcdermott/pretty-print-directory) for easy
-    visualization of directory structures in tests (especially doctests).
-- [`yaml_to_disk`](https://github.com/mmcdermott/yaml_to_disk) to easily initialize a temporary directory
-    structure from a YAML string in tests (especially doctests).
-- [`pytest-codeblocks`](https://github.com/nschloe/pytest-codeblocks) to enable testing shell codeblocks as
-    well as python codeblocks in markdown files; however, this would make it more challenging to have
-    non-tested codeblocks in markdown files, so there are tradeoffs.
+>>> loinc = findings["code_metadata.ontology.by_vocabulary.LOINC.numeric.mean"]
+>>> loinc.baseline, loinc.current                         # Fahrenheit -> Celsius
+(103.9, 88.1595)
 
-### Additional Files
+```
 
-#### `README.md`
+Note what the second one does *not* say. The vocabulary change is detected by a digest, so neither
+the old code nor the new one appears anywhere in the report:
 
-This file contains the main documentation for your project, and should be kept up to date.
+```python
+>>> blob = json.dumps(report.to_dict())
+>>> "SODIUM" in blob or "LAB//NA" in blob
+False
 
-#### `LICENSE`
+```
 
-This file contains the license for your project. Often, [The MIT License](https://opensource.org/license/mit)
-is a good choice for research projects.
+And note what the third one *does*. The per-code moments digest says only "some code's distribution
+moved"; the per-vocabulary moments narrow it to the LOINC-mapped measurements. That is as specific
+as a report can get without naming a code.
 
-#### `CONTRIBUTORS.md`
+### 3. A genuine data refresh
 
-This is the **source of truth** for build, test, code-style, and PR-workflow conventions. Both
-human contributors and AI agents (via `AGENTS.md`) are pointed at this file. The included guide in
-the template is a good starting point — keep it up to date as your project's conventions evolve.
+[`examples/datasets/v2_data_refresh`](examples/datasets/v2_data_refresh) bumps `dataset_version` to
+`2.0` and has 220 subjects instead of 160 — same schema, same vocabulary, more data. Strictly, that
+fails:
 
-#### `AGENTS.md` and `CLAUDE.md`
+```python
+>>> refreshed = read_summary_stats(EXAMPLES / "stats" / "v2_data_refresh.json")
+>>> compare_summary_stats(baseline, refreshed).failed
+True
 
-`AGENTS.md` provides AI coding agents (Claude Code, Cursor, Copilot, Codex CLI, Gemini CLI, and
-others) with a short pointer to `CONTRIBUTORS.md` plus a handful of agent-specific reminders
-(use `gh` not the GitHub MCP, doctest namespace pre-population, TDD encouragement, what not to do).
-`CLAUDE.md` is a symlink to `AGENTS.md` so Claude Code picks up the same instructions via its
-native path. See the "AI-Assisted Development" section of [`CONTRIBUTORS.md`](CONTRIBUTORS.md) for
-one-time setup instructions covering Claude Code, the `gh` CLI, and recommended MCP servers for
-web search and library documentation.
+```
 
-### Repository management
+Which is the wrong answer, and why `relax` exists. It tells the comparison that a version bump
+excuses volume drift but nothing else:
 
-This repository lives within the
-[McDermott Health AI Lab GitHub Organization](https://github.com/McDermottHealthAI), which sets
-default issue labels and (in time) issue templates that propagate to new repos. Use those labels
-on new issues so filings stay searchable and consistent. All changes to `main` go through pull
-requests; see the "Pull Request Workflow" section of [`CONTRIBUTORS.md`](CONTRIBUTORS.md) for the
-expected flow (closing keywords, CI watching, comment replies, merge-vs-rebase policy). Versioning
-follows semantic versioning, managed through `git` tags (e.g., `git tag 0.0.1`) — `setuptools-scm`
-reads the tag and stamps the package version automatically.
+```bash
+compare_MEDS_summary_stats examples/stats/v1_baseline.json current.json \
+	--on-dataset-version-change relax # exit 0
+```
+
+```python
+>>> from meds_summary_stats.policy import ComparePolicy
+>>> policy = ComparePolicy.from_dict({"on_dataset_version_change": "relax"})
+>>> relaxed = compare_summary_stats(baseline, refreshed, policy)
+>>> relaxed.status, relaxed.failed, relaxed.counts
+('warn', False, {'error': 0, 'info': 60, 'warning': 3})
+
+```
+
+The 60 volume findings drop to informational. What survives as a warning is only the *ordering* of
+the vocabulary by frequency, which genuinely did shift as the cohort grew:
+
+```python
+>>> sorted(f.path for f in relaxed.findings if str(f.severity) == "warning")
+['codes.digests.by_measurement_frequency', 'codes.digests.by_subject_frequency',
+ 'codes.digests.numeric_moments.digest']
+
+```
+
+Crucially, `relax` does not blind the check. The set of codes is unchanged here, and if the refresh
+*had* also broken the vocabulary or the schema, that would still be a hard error:
+
+```python
+>>> baseline["codes"]["digests"]["alphabetical"] == refreshed["codes"]["digests"]["alphabetical"]
+True
+>>> from copy import deepcopy
+>>> also_broken = deepcopy(refreshed)
+>>> also_broken["layout"]["data_columns"]["subject_id"] = "Int32"
+>>> broken_report = compare_summary_stats(baseline, also_broken, policy)
+>>> broken_report.failed
+True
+>>> [f.path for f in broken_report.findings if str(f.severity) == "error"]
+['layout.data_columns.subject_id']
+
+```
+
+The two failure modes are distinguishable, which is the whole point: a data refresh moves volume, a
+broken ETL moves volume *and* the vocabulary *and* a distribution.
+
+## What it emits
+
+A single canonical JSON document. Roughly:
+
+| Block           | Contents                                                                                                                   |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `counts`        | subjects, measurements, events, unique codes, static rows, births, deaths, global numeric moments, data-quality invariants |
+| `codes`         | vocabulary digests, occurrence distributions, concentration curves                                                         |
+| `code_metadata` | metadata coverage, plus per-external-vocabulary statistics and mapping coverage from `parent_codes`                        |
+| `per_subject`   | distributions of measurements, events, distinct codes, and record span per subject                                         |
+| `time`          | calendar-year histogram, optional time quantiles                                                                           |
+| `splits`        | per-split subject and measurement counts, plus data/split membership mismatches                                            |
+| `layout`        | shard count, column names and dtypes, per-shard presence, dtype conflicts                                                  |
+| `dataset`       | verbatim `metadata/dataset.json`                                                                                           |
+
+[**`docs/stats-surface.md`**](docs/stats-surface.md) documents every field, with live output.
+
+### The privacy contract
+
+The output is designed to be committable to a public repository as a baseline. Three rules, enforced
+structurally rather than by convention:
+
+1. **No code string is ever emitted** — at any threshold, under any flag. The vocabulary appears
+    only as digests (`sha256` over the sorted code list, over the frequency-ordered list, and over
+    frequency-restricted subsets) and as aggregate distributions. That is enough to detect that the
+    vocabulary changed, and never enough to reconstruct it. Nor is the vocabulary ever partitioned
+    by the *structure* of the code strings: splitting on the common `//` convention is not done,
+    both because MEDS does not require it and because for a flat vocabulary the prefix is the whole
+    code, so the list of prefixes would be the list of codes.
+2. **No small cells.** Any split, calendar-year, or ontology-vocabulary entry backed by fewer than
+    `min_cell_size` distinct subjects (default 20) is dropped entirely — the key is never written,
+    only a `<suppressed>` rollup of how many were dropped and their pooled volume.
+3. **No extremes.** No `min`, no `max`, anywhere. Not on values, not on timestamps. The subject with
+    the longest record is exactly where re-identification starts; quantiles replace extremes, and
+    are themselves suppressed below `min_numeric_cell_size` observations.
+
+The one exception is deliberate, and it is where the deeper vocabulary inspection lives:
+`parent_codes` entries name concepts in published external terminologies (`LOINC/8867-4`), which are
+properties of the terminology rather than of any patient — and, decisively, the grouping is
+*declared by the dataset* rather than guessed from string shape. So that block reports vocabularies
+by name, with per-vocabulary volume, subject counts, numeric moments, and key-set digests (still
+subject to suppression), plus dataset-level mapping coverage. It is the only axis that says *where*
+the vocabulary moved, and it catches a regression nothing else can: when a concept-mapping join
+silently stops resolving, every count over the data is unchanged and only
+`ontology.coverage.frac_measurements_mapped` falls.
+
+## How comparison works
+
+Both documents flatten to `path -> value`. Each path resolves to exactly one rule — the most
+specific glob that matches it — and the rule says how to compare:
+
+| kind       | behavior                                                          |
+| ---------- | ----------------------------------------------------------------- |
+| `exact`    | any inequality is a finding (schema, dtypes, digests)             |
+| `relative` | flag when `abs(new - old) / max(abs(old), 1)` exceeds a threshold |
+| `absolute` | flag when the raw delta exceeds a threshold                       |
+| `ignore`   | never compared (timestamps, tool version)                         |
+
+Each rule has a `warn` and an `error` tier. The built-in policy is already a reasonable ETL
+regression policy; a config file only states your overrides:
+
+```yaml
+on_dataset_version_change: relax
+fail_on: error
+rules:
+  - {path: counts.n_subjects, kind: relative, warn: 0.0, error: 0.002}
+  - {path: codes.digests.alphabetical, kind: exact, on_change: error}
+  - {path: time.by_year.*.n_measurements, kind: relative, error: 0.05}
+```
+
+See [`examples/policy.yaml`](examples/policy.yaml) for a fully commented one.
+
+### `on_dataset_version_change: relax`
+
+The setting that makes the motivating workflow practical. The premise of the check is "same data,
+new ETL". When the data itself moved — `dataset.dataset_version` differs — volume drift is expected
+and flagging it is noise, but a schema or vocabulary regression is still a bug. `relax` draws that
+line: everything numeric drops to informational, `exact` rules stay hard.
+
+```python
+>>> from copy import deepcopy
+>>> from meds_summary_stats.policy import ComparePolicy
+>>> baseline = {"stats_schema_version": 1, "config": {},
+...             "dataset": {"dataset_version": "1.0"},
+...             "layout": {"data_columns": {"code": "String"}},
+...             "counts": {"n_subjects": 100_000}}
+>>> refreshed = deepcopy(baseline)
+>>> refreshed["dataset"]["dataset_version"] = "2.0"
+>>> refreshed["counts"]["n_subjects"] = 140_000
+
+Strictly, a 40% jump in subjects is a failure:
+
+>>> compare_summary_stats(baseline, refreshed).status
+'fail'
+
+Under `relax`, it is expected -- the data changed:
+
+>>> policy = ComparePolicy.from_dict({"on_dataset_version_change": "relax"})
+>>> compare_summary_stats(baseline, refreshed, policy).status
+'pass'
+
+But a schema change is never excused:
+
+>>> broken = deepcopy(refreshed)
+>>> broken["layout"]["data_columns"]["code"] = "Int64"
+>>> report = compare_summary_stats(baseline, broken, policy)
+>>> report.status, [f.path for f in report.findings if str(f.severity) == "error"]
+('fail', ['layout.data_columns.code'])
+
+```
+
+### Reading a report
+
+```python
+>>> from meds_summary_stats.report import render_text
+>>> regressed = deepcopy(baseline)
+>>> regressed["counts"]["n_subjects"] = 98_000
+>>> print(render_text(compare_summary_stats(baseline, regressed)))
+FAIL - 3 paths checked, 0 ignored; 1 error.
+<BLANKLINE>
+ERROR (1)
+  counts.n_subjects
+      100000 -> 98000 (-2.00%), over relative threshold 0.005
+
+```
+
+`compare_MEDS_summary_stats` also writes a machine-readable report (`--output`) and a
+GitHub-flavored markdown one (`--markdown`), and appends the markdown to `$GITHUB_STEP_SUMMARY`
+when it is running inside Actions.
+
+## In CI
+
+A composite GitHub Action, usable from any repository:
+
+```yaml
+  - name: Check for summary-stat regressions
+    uses: Medical-Event-Data-Standard/meds_summary_stats@v0
+    with:
+      meds-dir: build/meds
+      baseline: baselines/mimic-iv-3.1.json
+      policy: .github/meds-stats-policy.yaml
+      package-spec: meds_summary_stats==0.1.0
+```
+
+[**`docs/github-action.md`**](docs/github-action.md) covers the reusable-workflow form, advisory
+rollout with `fail-on: never`, reacting to the outcome, label-gated baseline refresh, and the full
+input/output/exit-code tables.
+
+## Performance
+
+One `scan_parquet` per shard, normalized and concatenated, then a handful of aggregates collected
+together on the polars streaming engine so the common scan is shared. The dataset is read a small
+fixed number of times regardless of its size, and the only frames materialized are per-subject and
+per-code — both orders of magnitude smaller than the data.
+
+The default `numeric-detail: moments` needs no sorting. `quantiles` adds full-column quantiles over
+`numeric_value` and `time`, which does require materializing those columns; it is opt-in for that
+reason. Per-subject and per-code quantiles are always computed, since those frames are small.
+
+## Installation
+
+```bash
+uv add meds_summary_stats # or: uvx --from meds_summary_stats extract_MEDS_summary_stats --help
+```
+
+Requires Python 3.12+.
+
+## Contributing
+
+See [`CONTRIBUTORS.md`](CONTRIBUTORS.md). Briefly: `uv sync --group dev`, then `uv run pytest -v`.
+Tests are predominantly doctests — the API-level behavior of essentially every function is pinned by
+examples in its docstring, with `tests/` reserved for end-to-end runs and
+[hypothesis](https://hypothesis.readthedocs.io/) properties (notably, that no code string ever
+escapes into the output for *any* dataset).
+
+## License
+
+MIT

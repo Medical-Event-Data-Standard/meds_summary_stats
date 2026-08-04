@@ -1,0 +1,7 @@
+{
+  "dataset_name": "example_hospital",
+  "dataset_version": "2.0",
+  "etl_name": "example_etl",
+  "etl_version": "0.3.1",
+  "meds_version": "0.4.1"
+}

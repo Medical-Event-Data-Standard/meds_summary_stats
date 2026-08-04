@@ -1,0 +1,184 @@
+# Reusable workflow: run the MEDS summary-stats regression check as its own job.
+#
+# Use this when you want the check to have separate logs, its own runner, and its own summary panel.
+# Use the composite action in `action.yml` instead when you want it as a step inside a job that has
+# already built the dataset. See docs/github-action.md.
+#
+# This invokes the CLIs directly rather than reusing `action.yml`. A reusable workflow cannot
+# reference an action from its own repository at the ref it was called with -- it would have to
+# hardcode one -- so calling this at a tag would silently run `main`'s action. Invoking the
+# published package via `package-spec` keeps the version under the caller's control instead.
+
+name: MEDS summary-stats regression
+
+on:
+  workflow_call:
+    inputs:
+      meds-dir:
+        description: Root of the MEDS dataset to summarize.
+        required: true
+        type: string
+      baseline:
+        description: Path to the baseline stats JSON. Leave empty to extract only.
+        required: false
+        default: ""
+        type: string
+      build-command:
+        description: >-
+          Shell command run before extraction, to produce the dataset (an ETL invocation, a
+          download, a decrypt). Leave empty if `meds-dir` already exists in the checkout.
+        required: false
+        default: ""
+        type: string
+      policy:
+        description: Path to a YAML comparison policy.
+        required: false
+        default: ""
+        type: string
+      extract-config:
+        description: Path to a YAML extraction config.
+        required: false
+        default: ""
+        type: string
+      fail-on:
+        description: "Minimum severity that fails the job: error, warning, or never."
+        required: false
+        default: error
+        type: string
+      on-dataset-version-change:
+        description: "ignore, warn, error, or relax."
+        required: false
+        default: warn
+        type: string
+      package-spec:
+        description: What to install, e.g. 'meds_summary_stats==0.1.0'. Pin it for reproducible CI.
+        required: false
+        default: meds_summary_stats
+        type: string
+      python-version:
+        description: Python version used to run the tool.
+        required: false
+        default: "3.12"
+        type: string
+      runs-on:
+        description: Runner label.
+        required: false
+        default: ubuntu-latest
+        type: string
+      timeout-minutes:
+        description: Job timeout.
+        required: false
+        default: 60
+        type: number
+    outputs:
+      status:
+        description: "pass, warn, or fail -- what was found."
+        value: ${{ jobs.check.outputs.status }}
+      failed:
+        description: "'true' if the findings breached fail-on -- what the policy makes of it."
+        value: ${{ jobs.check.outputs.failed }}
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    outputs:
+      status: ${{ steps.compare.outputs.status }}
+      failed: ${{ steps.compare.outputs.failed }}
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+          cache-suffix: meds-summary-stats
+
+      - name: Build the dataset
+        if: inputs.build-command != ''
+        shell: bash
+        env:
+          BUILD_COMMAND: ${{ inputs.build-command }}
+        run: bash -euo pipefail -c "$BUILD_COMMAND"
+
+      # Inputs reach the shell through `env:` rather than `${{ }}` interpolation, so a value
+      # containing shell metacharacters is data, not code.
+      - name: Extract summary statistics
+        shell: bash
+        env:
+          MEDS_DIR: ${{ inputs.meds-dir }}
+          EXTRACT_CONFIG: ${{ inputs.extract-config }}
+          PACKAGE_SPEC: ${{ inputs.package-spec }}
+        run: |
+          set -euo pipefail
+          args=("$MEDS_DIR" --output meds-summary-stats.json)
+          if [[ -n "$EXTRACT_CONFIG" ]]; then args+=(--config "$EXTRACT_CONFIG"); fi
+          uvx --from "$PACKAGE_SPEC" extract_MEDS_summary_stats "${args[@]}"
+
+      - name: Compare against baseline
+        id: compare
+        if: inputs.baseline != ''
+        shell: bash
+        env:
+          BASELINE: ${{ inputs.baseline }}
+          POLICY: ${{ inputs.policy }}
+          FAIL_ON: ${{ inputs.fail-on }}
+          ON_VERSION_CHANGE: ${{ inputs.on-dataset-version-change }}
+          PACKAGE_SPEC: ${{ inputs.package-spec }}
+        run: |
+          set -uo pipefail
+
+          if [[ ! -f "$BASELINE" ]]; then
+            echo "::error::Baseline file not found: $BASELINE"
+            exit 1
+          fi
+
+          args=("$BASELINE" meds-summary-stats.json
+                --output meds-summary-stats-report.json
+                --markdown meds-summary-stats-report.md
+                --fail-on "$FAIL_ON"
+                --on-dataset-version-change "$ON_VERSION_CHANGE")
+          if [[ -n "$POLICY" ]]; then args+=(--config "$POLICY"); fi
+
+          # The tool writes its markdown to $GITHUB_STEP_SUMMARY and its verdict to $GITHUB_OUTPUT
+          # itself. `set -e` is off deliberately: exit 1 means "regression found", which must not
+          # abort before artifacts upload. Anything above 1 is a genuine tool failure.
+          uvx --from "$PACKAGE_SPEC" compare_MEDS_summary_stats "${args[@]}"
+          code=$?
+          if (( code > 1 )); then
+            echo "::error::compare_MEDS_summary_stats exited with code $code"
+            exit "$code"
+          fi
+
+      - name: Upload artifacts
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: meds-summary-stats
+          path: |
+            meds-summary-stats.json
+            meds-summary-stats-report.json
+            meds-summary-stats-report.md
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Fail on regression
+        if: steps.compare.outputs.failed == 'true'
+        shell: bash
+        env:
+          STATUS: ${{ steps.compare.outputs.status }}
+          N_ERRORS: ${{ steps.compare.outputs.n_errors }}
+          N_WARNINGS: ${{ steps.compare.outputs.n_warnings }}
+        run: |
+          echo "::error::MEDS summary-stats comparison reported '${STATUS}'" \
+               "(${N_ERRORS} errors, ${N_WARNINGS} warnings). See the job summary for details."
+          exit 1

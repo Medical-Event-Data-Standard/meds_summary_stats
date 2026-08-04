@@ -3,44 +3,54 @@ requires = ["setuptools>=80.9.0", "setuptools-scm>=9.2", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "package_name"
+name = "meds_summary_stats"
 dynamic = ["version"] # Makes setuptools-scm manage the version
 authors = [
-  {name="Matthew McDermott", email="mattmcdermott8@gmail.com"}, # Replace with your team's details
+  {name="Matthew McDermott", email="mattmcdermott8@gmail.com"},
 ]
-description = "Add your description here"
+description = "Fast, privacy-safe summary statistics over MEDS datasets, for validating and regression-testing MEDS ETLs."
 readme = "README.md"
 requires-python = ">=3.12"
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License", # Change if not using MIT license
+    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
 dependencies = [
-] # Add your runtime dependencies here
+  "meds~=0.4.0",
+  "polars>=1.20",
+  "pyyaml",
+]
 
 [dependency-groups]
 dev = [
   "pre-commit<4", "ruff", "pytest", "pytest-cov", "pretty-print-directory",
+  "hypothesis", "yaml-to-disk", "meds-testing-helpers",
+  # Only used by doctests that need to control parquet dtypes precisely; polars reads and writes
+  # parquet without it, so it is not a runtime dependency of the package.
+  "pyarrow",
   # shfmt-py bundles the `shfmt` binary used by the mdformat-shfmt pre-commit
   # hook. Pinning it here (in addition to the pre-commit hook's
   # additional_dependencies) gives a single source of truth and keeps local
   # `uv run mdformat ...` runs consistent with CI pre-commit runs.
   "shfmt-py==3.12.0.2",
-] # Add your development (lint, test) dependencies here
-docs = [] # Add your documentation dependencies here (I recommend mkdocs-material)
+]
+docs = []
 
 [tool.setuptools_scm] # Required for setuptools-scm to work, even if empty
 
-[project.optional-dependencies] # Add any optional dependencies here, installable via `pip install .[extra]`
+[project.optional-dependencies]
 
-[project.scripts] # Add any console scripts here
+[project.scripts]
+extract_MEDS_summary_stats = "meds_summary_stats.cli:extract_main"
+compare_MEDS_summary_stats = "meds_summary_stats.cli:compare_main"
 
 [tool.pytest.ini_options] # Default pytest options
 addopts = [
   "--color=yes",
   "--doctest-modules", # Ensures that doctest runs
-  "--ignore=docs",
+  # The template ignores docs/ on the assumption it is generated. Here it is hand-written and
+  # doctested, so it must be collected -- an untested example in the docs is a lie waiting to happen.
   "--ignore=AGENTS.md",
   "--ignore=CONTRIBUTORS.md",
   "--doctest-glob=*.md",
@@ -50,8 +60,8 @@ markers = [] # Add any custom pytest markers here
 doctest_optionflags = ["NORMALIZE_WHITESPACE", "ELLIPSIS"]
 
 [project.urls]
-Homepage = "https://github.com/McDermottHealthAI/REPO_NAME" # Replace with your repo URL
-Issues = "https://github.com/McDermottHealthAI/REPO_NAME/issues" # Replace with your repo URL
+Homepage = "https://github.com/Medical-Event-Data-Standard/meds_summary_stats"
+Issues = "https://github.com/Medical-Event-Data-Standard/meds_summary_stats/issues"
 
 [tool.ruff] # Ruff configuration for linting and formatting
 target-version = "py312"
@@ -78,6 +88,13 @@ select = [
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]  # Unused imports in __init__ files
 "test_*" = ["DTZ001"]  # Ignore datetimez in test files
+# Test *modules* and *classes* still need docstrings (they carry the "why"); individual test
+# methods do not, because a well-named test function is already its own sentence.
+# TC003 would push `Path` into a type-checking block, but tests use it at runtime too.
+"tests/**" = ["D102", "D103", "DTZ001", "TC003"]
+# MEDS `time` is a timezone-naive `timestamp[us]` by schema, so the example datasets must be built
+# from naive datetimes; DTZ001 would have us attach a tzinfo the format does not carry.
+"examples/**" = ["DTZ001"]
 
 [tool.ruff.lint.pep8-naming]
 extend-ignore-names = ["*MEDS*", "*NRT*", "D", "L"] # Allow common abbreviations; "D" is used for distributions/datasets
@@ -86,4 +103,4 @@ extend-ignore-names = ["*MEDS*", "*NRT*", "D", "L"] # Allow common abbreviations
 convention = "google"
 
 [tool.ruff.lint.isort]
-known-first-party = ["package_name"]  # Replace with your actual package name
+known-first-party = ["meds_summary_stats"]
