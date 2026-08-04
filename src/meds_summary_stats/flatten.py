@@ -16,8 +16,8 @@ SEP = "."
 
 #: Replacement for a separator character occurring inside a key.
 #:
-#: Keys in a stats document are namespaces, split names, and calendar years -- none of which normally
-#: contain a dot, but ETL-produced split names are not guaranteed to behave.
+#: Keys in a stats document are vocabulary names, split names, and calendar years -- none of which
+#: normally contain a dot, but ETL-produced split names are not guaranteed to behave.
 ESCAPED_SEP = "\\."
 
 
@@ -122,9 +122,10 @@ def matches(path: str, pattern: str) -> bool:
 
         Wildcards work mid-path, which is how per-key rules are written:
 
-        >>> matches("codes.by_namespace.LAB.n_subjects", "codes.by_namespace.*.n_subjects")
+        >>> ontology = "code_metadata.ontology.by_vocabulary"
+        >>> matches(f"{ontology}.LOINC.n_subjects", f"{ontology}.*.n_subjects")
         True
-        >>> matches("codes.by_namespace.LAB.numeric.mean", "codes.by_namespace.*.n_subjects")
+        >>> matches(f"{ontology}.LOINC.numeric.mean", f"{ontology}.*.n_subjects")
         False
     """
     if pattern.endswith(f"{SEP}**") and path == pattern[: -len(f"{SEP}**")]:
@@ -177,7 +178,7 @@ def specificity(pattern: str) -> tuple[int, int, int]:
         True
         >>> specificity("counts.*") > specificity("**")
         True
-        >>> specificity("codes.by_namespace.*.n_subjects") > specificity("codes.by_namespace.**")
+        >>> specificity("splits.by_split.*.n_subjects") > specificity("splits.by_split.**")
         True
     """
     parts = pattern.split(SEP)

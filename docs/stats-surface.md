@@ -25,7 +25,7 @@ Three rules, enforced structurally rather than by convention:
 
 1. **No code string is ever emitted.** Not at any suppression threshold, not under any flag. The
     vocabulary is represented only by digests and by aggregate distributions over it.
-2. **No cell is reported below the subject floor.** Namespace, split, calendar-year, and ontology
+2. **No cell is reported below the subject floor.** Split, calendar-year, and ontology-vocabulary
     entries backed by fewer than `min_cell_size` distinct subjects are dropped — the *key itself* is
     never written, only a `<suppressed>` rollup of how many were dropped and their pooled volume.
     The rollup deliberately omits a pooled subject count, since summing distinct-subject counts
@@ -90,7 +90,7 @@ why the default policy compares them with an absolute threshold of 0.
 ## `codes` — the vocabulary, without the vocabulary
 
 The hardest part of the design: be sensitive to vocabulary drift without publishing the vocabulary.
-Four complementary views, which fail differently.
+Three complementary views, which fail differently.
 
 ### Digests
 
@@ -129,9 +129,10 @@ cover most of the vocabulary.)
 
 `numeric_moments` is a change *detector* rather than a change *description*: it hashes each
 sufficiently-common code's rounded mean and standard deviation, so a unit-conversion regression on
-any single lab trips it without the report saying which lab. Combined with the per-namespace
-moments below, you get "something shifted, and it was in the `LAB` namespace" — enough to start
-debugging, and no more than that.
+any single lab trips it without the report saying which lab. Combined with the per-vocabulary
+moments in the [ontology block](#code_metadata-and-ontology--the-only-grouping-axis),
+you get "something shifted, and it was among the LOINC-mapped codes" — enough to start debugging,
+and no more than that.
 
 ### Shape and concentration
 
@@ -152,87 +153,114 @@ A mapping regression that collapses many codes into one, or explodes one into ma
 sharply even when the total measurement count is unchanged. `codes.occurrence` complements them with
 the distribution of per-code measurement and subject counts.
 
-### Namespaces
+### What is deliberately absent: any partition by code structure
 
-The `//`-delimited namespace is the coarsest useful cut of the vocabulary, and the only place the
-report says *where* something changed.
+Many MEDS ETLs write codes as `SPACE//CODE` — `LAB//GLUCOSE`, `DIAGNOSIS//ICD10CM//E11.9`. Splitting
+on `//` would give a cheap "which part of the vocabulary moved" axis, and this package does not do
+it. Two reasons, either sufficient:
+
+- **MEDS does not require the convention.** An axis that exists on some datasets and not others is
+    not something a comparison policy can be written against, and its silent absence would read as
+    "nothing changed here" rather than "this was never measured".
+- **For a flat vocabulary it is not a partition at all.** If codes are `HR`, `HEIGHT`, `TEMP`, then
+    the "namespace" of each code is the code, and emitting the namespace list emits the vocabulary.
+
+So the entire `codes` block is structure-blind:
 
 ```python
->>> print(json.dumps(stats["codes"]["by_namespace"], indent=2, sort_keys=True))
+>>> sorted(stats["codes"])
+['concentration', 'digests', 'n_codes_below_min_cell_size', 'n_unique_codes', 'occurrence']
+
+```
+
+The grouping axis comes from `parent_codes` instead, where the groups are declared by the dataset
+rather than inferred from string shape. That is the next section.
+
+## `code_metadata` and `ontology` — the only grouping axis
+
+`parent_codes` entries point into published external terminologies — `LOINC/8867-4`,
+`ICD10CM/E11.9`. Unlike a dataset's own code strings, the identity of those vocabularies is a
+property of the terminology, not of any patient, and — decisively — the grouping is *declared by the
+dataset* rather than inferred from how the codes happen to be spelled. That is why this is both the
+one block that reports names and the one axis along which the vocabulary is partitioned.
+
+### Per-vocabulary statistics
+
+```python
+>>> print(json.dumps(stats["code_metadata"]["ontology"]["by_vocabulary"], indent=2, sort_keys=True))
 {
-  "<no-namespace>": {
-    "n_codes": 5,
-    "n_measurements": 50,
+  "LOINC": {
+    "keys_digest": "sha256:...",
+    "n_child_codes": 2,
+    "n_distinct_keys": 2,
+    "n_measurements": 32,
     "n_subjects": 6,
     "numeric": {
-      "mean": 113.994,
-      "n_finite": 38,
-      "std": 26.385
-    }
-  },
-  "ADMISSION": {
-    "n_codes": 3,
-    "n_measurements": 6,
-    "n_subjects": 6
-  },
-  "EYE_COLOR": {
-    "n_codes": 3,
-    "n_measurements": 6,
-    "n_subjects": 6
+      "mean": 104.691,
+      "n_finite": 32,
+      "std": 16.0519
+    },
+    "recognized": true
   }
 }
 
 ```
 
-> [!IMPORTANT]
-> Codes with no `//` are pooled under `<no-namespace>` rather than forming a namespace of their own.
-> For a flat vocabulary such as `HR` or `HEIGHT`, "the namespace" and "the code" are the same string,
-> so bucketing them by namespace would republish exactly what this package exists to withhold.
-> `codes.n_codes_without_namespace` tells you how much of the vocabulary this affects.
+`numeric` is the finest-grained "where did it move" signal the document offers, and the direct
+replacement for a per-namespace view: a unit conversion applied to the LOINC-mapped labs moves this
+mean while leaving every global count untouched.
 
-## `code_metadata` and `ontology` — the one place identifiers are safe
+`recognized` flags whether the vocabulary is a known OMOP CDM `vocabulary_id`. Suppression applies
+to the statistics as everywhere else — a vocabulary reached by too few subjects is rolled up into
+`<suppressed>`, because its measurement count would otherwise describe a tiny cohort. Set
+`emit_ontology_keys: true` to list every key per vocabulary; that is off by default for output
+size, not for privacy.
 
-`parent_codes` entries point into published external terminologies — `LOINC/8867-4`,
-`ICD10CM/E11.9`. Unlike a dataset's own code strings, the identity of those vocabularies is a
-property of the terminology, not of any patient. So this is the one block that reports names.
+A code with parents in two vocabularies is counted under both, so `n_measurements` across
+vocabularies deliberately over-sums relative to the dataset total.
+
+### Coverage — where an unresolved mapping table announces itself
+
+These are dataset-level ratios and counts, so they are never suppressed.
 
 ```python
->>> print(json.dumps(stats["code_metadata"]["ontology"], indent=2, sort_keys=True))
+>>> print(json.dumps(stats["code_metadata"]["ontology"]["coverage"], indent=2, sort_keys=True))
 {
-  "by_vocabulary": {
-    "LOINC": {
-      "keys_digest": "sha256:...",
-      "n_child_codes": 2,
-      "n_distinct_keys": 2,
-      "n_measurements": 32,
-      "n_subjects": 6,
-      "recognized": true
-    }
-  },
-  "frac_codes_with_parents": 0.4,
-  "n_codes_with_parents": 2,
-  "n_distinct_parents": 2,
-  "n_parent_links": 2,
-  "n_parents_without_vocabulary": 0,
-  "n_vocabularies": 1,
-  "n_vocabularies_recognized": 1,
-  "parents_per_code": {...},
-  "present": true
+  "frac_measurements_mapped": 0.516129,
+  "frac_observed_codes_with_parents": 0.181818,
+  "n_measurements_mapped": 32,
+  "n_measurements_unmapped": 30,
+  "n_observed_codes": 11,
+  "n_observed_codes_with_parents": 2,
+  "n_observed_codes_without_parents": 9
 }
 
 ```
 
-`recognized` flags whether the vocabulary is a known OMOP CDM `vocabulary_id`. Suppression still
-applies to the *statistics*: a vocabulary reached by too few subjects is rolled up, because its
-measurement count would otherwise describe a tiny cohort. Set `emit_ontology_keys: true` to list
-every key per vocabulary — off by default for output size, not for privacy.
+This is the block that catches a class of regression nothing else can. When a concept-mapping join
+silently stops resolving, the ETL still emits every row: the subject count, measurement count, code
+count, and schema are all identical. What changes is that codes stop reaching an ontology —
+`frac_measurements_mapped` falls, `n_observed_codes_without_parents` rises. The default policy
+treats any downward movement in the former as at least a warning.
 
-This block is a sharp ETL signal that nothing else catches: a concept-mapping table that silently
-stops resolving shows up here as a vocabulary whose link count collapsed, while every count over
-the data itself stays exactly the same.
+### Structure of the linkage
 
-Alongside it, `code_metadata` checks the MEDS invariant that every code in the data appears in
-`metadata/codes.parquet`:
+```python
+>>> ontology = stats["code_metadata"]["ontology"]
+>>> {k: ontology[k] for k in ("n_parent_links", "n_distinct_parents", "n_vocabularies",
+...                           "n_vocabularies_recognized", "n_codes_in_multiple_vocabularies",
+...                           "n_parents_without_vocabulary")}
+{'n_parent_links': 2, 'n_distinct_parents': 2, 'n_vocabularies': 1, 'n_vocabularies_recognized': 1,
+ 'n_codes_in_multiple_vocabularies': 0, 'n_parents_without_vocabulary': 0}
+
+```
+
+`parents_per_code` and `vocabularies_per_code` report the distributions of those two counts across
+the metadata vocabulary. `n_parents_without_vocabulary` counts parent codes with no `/` separator at
+all — those cannot be attributed to a terminology and are pooled rather than guessed at.
+
+Alongside all of this, `code_metadata` checks the MEDS invariant that every code in the data appears
+in `metadata/codes.parquet`:
 
 ```python
 >>> {k: stats["code_metadata"][k] for k in

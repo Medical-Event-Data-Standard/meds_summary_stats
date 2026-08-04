@@ -14,12 +14,6 @@ from typing import Any
 
 import yaml
 
-#: Bucket label for codes that carry no ``//`` namespace separator.
-#:
-#: Un-namespaced codes such as ``HR`` are their own namespace, so bucketing them by namespace would
-#: republish the code verbatim. They are pooled under this sentinel instead.
-NO_NAMESPACE = "<no-namespace>"
-
 #: Bucket label for parent codes that carry no ``/`` vocabulary separator.
 NO_VOCABULARY = "<no-vocabulary>"
 

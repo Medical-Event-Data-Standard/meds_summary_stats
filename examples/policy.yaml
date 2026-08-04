@@ -85,10 +85,19 @@ rules:
   # Distributions. Loosen for genuinely noisy quantities; tighten where a shift means a unit
   # conversion or a clamping bug.
   # ------------------------------------------------------------------------------------------
-  - path: codes.by_namespace.*.numeric.mean
+  # Per-vocabulary numeric moments are the finest-grained "where did it move" signal available,
+  # since the vocabulary is never partitioned by the shape of the code strings themselves.
+  - path: code_metadata.ontology.by_vocabulary.*.numeric.mean
     kind: relative
     warn: 0.002
     error: 0.01
+
+  # A mapping table that silently stops resolving shows up here and nowhere else: every count over
+  # the data itself is unchanged, but the share of measurements reaching an ontology collapses.
+  - path: code_metadata.ontology.coverage.frac_measurements_mapped
+    kind: relative
+    warn: 0.0
+    error: 0.005
 
   - path: per_subject.**.quantiles.*
     kind: relative

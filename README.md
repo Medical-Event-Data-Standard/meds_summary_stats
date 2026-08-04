@@ -52,8 +52,8 @@ A single canonical JSON document. Roughly:
 | Block           | Contents                                                                                                                   |
 | --------------- | -------------------------------------------------------------------------------------------------------------------------- |
 | `counts`        | subjects, measurements, events, unique codes, static rows, births, deaths, global numeric moments, data-quality invariants |
-| `codes`         | vocabulary digests, occurrence distributions, concentration curves, per-namespace rollups                                  |
-| `code_metadata` | metadata coverage, and per-external-vocabulary ontology linkage from `parent_codes`                                        |
+| `codes`         | vocabulary digests, occurrence distributions, concentration curves                                                         |
+| `code_metadata` | metadata coverage, plus per-external-vocabulary statistics and mapping coverage from `parent_codes`                        |
 | `per_subject`   | distributions of measurements, events, distinct codes, and record span per subject                                         |
 | `time`          | calendar-year histogram, optional time quantiles                                                                           |
 | `splits`        | per-split subject and measurement counts, plus data/split membership mismatches                                            |
@@ -70,19 +70,26 @@ structurally rather than by convention:
 1. **No code string is ever emitted** — at any threshold, under any flag. The vocabulary appears
     only as digests (`sha256` over the sorted code list, over the frequency-ordered list, and over
     frequency-restricted subsets) and as aggregate distributions. That is enough to detect that the
-    vocabulary changed, and never enough to reconstruct it. Codes without a `//` namespace are
-    pooled under a sentinel rather than bucketed by themselves, so a flat vocabulary does not leak
-    through the namespace view either.
-2. **No small cells.** Any namespace, split, calendar-year, or ontology entry backed by fewer than
+    vocabulary changed, and never enough to reconstruct it. Nor is the vocabulary ever partitioned
+    by the *structure* of the code strings: splitting on the common `//` convention is not done,
+    both because MEDS does not require it and because for a flat vocabulary the prefix is the whole
+    code, so the list of prefixes would be the list of codes.
+2. **No small cells.** Any split, calendar-year, or ontology-vocabulary entry backed by fewer than
     `min_cell_size` distinct subjects (default 20) is dropped entirely — the key is never written,
     only a `<suppressed>` rollup of how many were dropped and their pooled volume.
 3. **No extremes.** No `min`, no `max`, anywhere. Not on values, not on timestamps. The subject with
     the longest record is exactly where re-identification starts; quantiles replace extremes, and
     are themselves suppressed below `min_numeric_cell_size` observations.
 
-The one exception is deliberate: `parent_codes` entries name concepts in published external
-terminologies (`LOINC/8867-4`), which are properties of the terminology rather than of any patient.
-Those vocabularies are reported by name, with their statistics still subject to suppression.
+The one exception is deliberate, and it is where the deeper vocabulary inspection lives:
+`parent_codes` entries name concepts in published external terminologies (`LOINC/8867-4`), which are
+properties of the terminology rather than of any patient — and, decisively, the grouping is
+*declared by the dataset* rather than guessed from string shape. So that block reports vocabularies
+by name, with per-vocabulary volume, subject counts, numeric moments, and key-set digests (still
+subject to suppression), plus dataset-level mapping coverage. It is the only axis that says *where*
+the vocabulary moved, and it catches a regression nothing else can: when a concept-mapping join
+silently stops resolving, every count over the data is unchanged and only
+`ontology.coverage.frac_measurements_mapped` falls.
 
 ## How comparison works
 

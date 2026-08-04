@@ -22,7 +22,7 @@ import meds
 import polars as pl
 
 from . import __version__
-from .config import NO_NAMESPACE, NO_VOCABULARY, SUPPRESSED, ExtractConfig
+from .config import NO_VOCABULARY, SUPPRESSED, ExtractConfig
 from .digests import digest, format_moment, ordered_by
 from .ontology import is_recognized, key_expr, vocabulary_expr
 
@@ -219,28 +219,6 @@ def _finite_numeric() -> pl.Expr:
     """
     nv = pl.col("numeric_value")
     return pl.when(nv.is_not_null() & nv.is_finite()).then(nv).otherwise(None)
-
-
-def namespace_expr() -> pl.Expr:
-    """Expression bucketing each code into its ``//``-delimited namespace.
-
-    Codes with no ``//`` are pooled under :data:`~meds_summary_stats.config.NO_NAMESPACE` rather than
-    forming a namespace of their own. This matters: for a flat vocabulary such as ``HR`` or ``HEIGHT``,
-    "the namespace" and "the code" are the same string, so bucketing by namespace would republish the
-    vocabulary this package exists to keep unpublished.
-
-    Examples:
-        >>> df = pl.DataFrame({"code": ["LAB//GLUCOSE", "LAB//NA", "HR", "A//B//C"]})
-        >>> df.select(ns=namespace_expr())["ns"].to_list()
-        ['LAB', 'LAB', '<no-namespace>', 'A']
-    """
-    head = pl.col("code").str.splitn("//", 2).struct.field("field_0")
-    return (
-        pl.when(pl.col("code").str.contains("//", literal=True))
-        .then(head)
-        .otherwise(pl.lit(NO_NAMESPACE))
-        .alias("namespace")
-    )
 
 
 def _suppress_keyed(
@@ -607,26 +585,53 @@ def _aggregate(
 
     Examples:
         >>> spec = {"data": {"0.parquet": {
-        ...     "subject_id": [1, 1, 2], "code": ["LAB//A", "LAB//A", "HR"],
+        ...     "subject_id": [1, 1, 2], "code": ["GLU", "GLU", "HR"],
         ...     "numeric_value": [1.0, 3.0, 60.0],
         ... }}}
         >>> with yaml_disk(spec) as d:
         ...     frames = _aggregate(_base_frame(_shard_paths(d), {"subject_id", "code", "numeric_value"}),
         ...                         ExtractConfig(), None)
         >>> sorted(frames)
-        ['by_namespace', 'by_year', 'overall', 'per_code', 'per_subject']
+        ['by_year', 'overall', 'per_code', 'per_subject']
         >>> frames["per_code"].sort("code").select("code", "n_measurements", "n_subjects")
         shape: (2, 3)
-        ┌────────┬────────────────┬────────────┐
-        │ code   ┆ n_measurements ┆ n_subjects │
-        │ ---    ┆ ---            ┆ ---        │
-        │ str    ┆ u32            ┆ u32        │
-        ╞════════╪════════════════╪════════════╡
-        │ HR     ┆ 1              ┆ 1          │
-        │ LAB//A ┆ 2              ┆ 1          │
-        └────────┴────────────────┴────────────┘
+        ┌──────┬────────────────┬────────────┐
+        │ code ┆ n_measurements ┆ n_subjects │
+        │ ---  ┆ ---            ┆ ---        │
+        │ str  ┆ u32            ┆ u32        │
+        ╞══════╪════════════════╪════════════╡
+        │ GLU  ┆ 2              ┆ 1          │
+        │ HR   ┆ 1              ┆ 1          │
+        └──────┴────────────────┴────────────┘
         >>> frames["overall"].select("n_measurements", "n_subjects", "numeric_mean").to_dicts()
         [{'n_measurements': 3, 'n_subjects': 2, 'numeric_mean': 21.333333333333332}]
+
+        When code metadata supplies a ``(code, vocabulary)`` mapping, an extra aggregate attributes
+        measurement volume and numeric moments to each external vocabulary. A code mapped into two
+        vocabularies is counted under both, so these columns do not sum to the dataset total:
+
+        >>> vocab_map = pl.LazyFrame({"code": ["GLU", "GLU", "HR"],
+        ...                           "vocabulary": ["LOINC", "SNOMED", "LOINC"]})
+        >>> with yaml_disk(spec) as d:
+        ...     frames = _aggregate(_base_frame(_shard_paths(d), {"subject_id", "code", "numeric_value"}),
+        ...                         ExtractConfig(), vocab_map)
+        >>> frames["by_vocabulary"].sort("vocabulary").select(
+        ...     "vocabulary", "n_measurements", "n_subjects", "n_child_codes")
+        shape: (2, 4)
+        ┌────────────┬────────────────┬────────────┬───────────────┐
+        │ vocabulary ┆ n_measurements ┆ n_subjects ┆ n_child_codes │
+        │ ---        ┆ ---            ┆ ---        ┆ ---           │
+        │ str        ┆ u32            ┆ u32        ┆ u32           │
+        ╞════════════╪════════════════╪════════════╪═══════════════╡
+        │ LOINC      ┆ 3              ┆ 2          ┆ 2             │
+        │ SNOMED     ┆ 2              ┆ 1          ┆ 1             │
+        └────────────┴────────────────┴────────────┴───────────────┘
+
+        A parallel aggregate covers the measurements whose code maps into no vocabulary at all,
+        which is the signal that a concept-mapping table has stopped resolving:
+
+        >>> frames["unmapped"].to_dicts()
+        [{'n_measurements': 0}]
     """
     nv = pl.col("numeric_value")
     finite = _finite_numeric()
@@ -666,20 +671,14 @@ def _aggregate(
             numeric_mean=finite.mean(),
             numeric_std=finite.std(),
         ),
-        "by_namespace": base.group_by(namespace_expr()).agg(
-            n_measurements=pl.len(),
-            n_subjects=pl.col("subject_id").n_unique(),
-            n_codes=pl.col("code").n_unique(),
-            numeric_n_finite=finite.count(),
-            numeric_mean=finite.mean(),
-            numeric_std=finite.std(),
-        ),
         "by_year": base.drop_nulls("time")
         .group_by(pl.col("time").dt.year().alias("year"))
         .agg(n_measurements=pl.len(), n_subjects=pl.col("subject_id").n_unique()),
     }
 
     if vocab_map is not None:
+        # A code with parents in two vocabularies is counted under both, so these columns
+        # deliberately over-sum relative to the dataset total.
         queries["by_vocabulary"] = (
             base.join(vocab_map, on="code", how="inner")
             .group_by("vocabulary")
@@ -687,7 +686,13 @@ def _aggregate(
                 n_measurements=pl.len(),
                 n_subjects=pl.col("subject_id").n_unique(),
                 n_child_codes=pl.col("code").n_unique(),
+                numeric_n_finite=finite.count(),
+                numeric_mean=finite.mean(),
+                numeric_std=finite.std(),
             )
+        )
+        queries["unmapped"] = base.join(vocab_map.select("code").unique(), on="code", how="anti").select(
+            n_measurements=pl.len()
         )
 
     if cfg.numeric_detail == "quantiles":
@@ -703,7 +708,7 @@ def _aggregate(
     return dict(zip(names, collected, strict=True))
 
 
-def _codes_block(per_code: pl.DataFrame, by_namespace: pl.DataFrame, cfg: ExtractConfig) -> dict[str, Any]:
+def _codes_block(per_code: pl.DataFrame, cfg: ExtractConfig) -> dict[str, Any]:
     """Summarize the code vocabulary without emitting any code.
 
     Three complementary views are reported, because they fail differently:
@@ -714,53 +719,43 @@ def _codes_block(per_code: pl.DataFrame, by_namespace: pl.DataFrame, cfg: Extrac
       thresholded variants, restricted to codes common enough that their ordering is stable.
     * **Occurrence distributions** answer "did the shape of the vocabulary change?" and survive
       benign additions to the tail.
-    * **Namespace rollups** answer "*where* did it change?", which is what a person debugging a failed
-      comparison actually needs.
+    * **Concentration** answers "did the head-versus-tail profile change?", which moves sharply when
+      a mapping bug collapses many codes into one or explodes one into many.
+
+    What is deliberately *not* here is any partition of the vocabulary by the structure of the code
+    strings themselves. Splitting on ``//`` would give a convenient "which part of the vocabulary
+    moved" axis, but MEDS does not require that convention, so the axis would be meaningful on some
+    datasets, absent on others, and -- for a flat vocabulary, where the prefix is the whole code --
+    would republish the vocabulary outright. The equivalent axis is taken from ``parent_codes``
+    instead, in :func:`_ontology_block`, where the groupings are declared rather than guessed.
 
     Args:
         per_code: Collected per-code aggregate.
-        by_namespace: Collected per-namespace aggregate.
         cfg: Extraction configuration.
 
     Returns:
         The ``codes`` block of the stats document.
 
     Examples:
-        >>> from pprint import pprint
         >>> per_code = pl.DataFrame({
-        ...     "code": ["LAB//A", "LAB//B", "HR"],
+        ...     "code": ["GLUCOSE", "SODIUM", "HR"],
         ...     "n_measurements": [100, 50, 10],
         ...     "n_subjects": [40, 30, 5],
         ...     "numeric_n_finite": [100, 0, 10],
         ...     "numeric_mean": [1.5, None, 60.0],
         ...     "numeric_std": [0.5, None, 5.0],
         ... })
-        >>> by_ns = pl.DataFrame({
-        ...     "namespace": ["LAB", "<no-namespace>"],
-        ...     "n_measurements": [150, 10], "n_subjects": [50, 5], "n_codes": [2, 1],
-        ...     "numeric_n_finite": [100, 10], "numeric_mean": [1.5, 60.0], "numeric_std": [0.5, 5.0],
-        ... })
-        >>> block = _codes_block(per_code, by_ns, ExtractConfig(min_cell_size=20))
+        >>> block = _codes_block(per_code, ExtractConfig(min_cell_size=20))
 
         No code string survives anywhere in the output:
 
-        >>> "LAB//A" in json.dumps(block) or "HR" in json.dumps(block)
+        >>> any(c in json.dumps(block) for c in ("GLUCOSE", "SODIUM", "HR"))
         False
 
         The rare code is excluded from the reportable count but still counted:
 
         >>> block["n_unique_codes"], block["n_codes_below_min_cell_size"]
         (3, 1)
-
-        The un-namespaced code is pooled, and its namespace entry is suppressed for having too few
-        subjects -- so a flat vocabulary leaks nothing through the namespace view:
-
-        >>> pprint(block["by_namespace"])
-        {'<suppressed>': {'n_codes': 1, 'n_measurements': 10, 'n_namespaces': 1},
-         'LAB': {'n_codes': 2,
-                 'n_measurements': 150,
-                 'n_subjects': 50,
-                 'numeric': {'mean': 1.5, 'n_finite': 100, 'std': 0.5}}}
 
         Digests are taken at every configured threshold, and each reports how many codes it covered so
         that a digest change can be read against a changing denominator:
@@ -803,28 +798,9 @@ def _codes_block(per_code: pl.DataFrame, by_namespace: pl.DataFrame, cfg: Extrac
         )
     ]
 
-    namespace_rows = []
-    for row in by_namespace.to_dicts():
-        entry = {
-            "namespace": row["namespace"],
-            "n_measurements": row["n_measurements"],
-            "n_subjects": row["n_subjects"],
-            "n_codes": row["n_codes"],
-        }
-        if (row["numeric_n_finite"] or 0) >= cfg.min_numeric_cell_size:
-            entry["numeric"] = {
-                "n_finite": row["numeric_n_finite"],
-                "mean": _round_sig(row["numeric_mean"]),
-                "std": _round_sig(row["numeric_std"]),
-            }
-        namespace_rows.append(entry)
-
     return {
         "n_unique_codes": per_code.height,
         "n_codes_below_min_cell_size": int((per_code["n_subjects"] < cfg.min_cell_size).sum()),
-        "n_codes_without_namespace": int(
-            by_namespace.filter(pl.col("namespace") == NO_NAMESPACE)["n_codes"].sum()
-        ),
         "digests": {
             "alphabetical": digest(sorted(codes)),
             "by_measurement_frequency": digest(ordered_by(codes, n_measurements)),
@@ -837,31 +813,41 @@ def _codes_block(per_code: pl.DataFrame, by_namespace: pl.DataFrame, cfg: Extrac
             "n_subjects": _distribution(per_code["n_subjects"].cast(pl.Float64), cfg),
         },
         "concentration": _concentration(n_measurements),
-        "by_namespace": _suppress_keyed(
-            namespace_rows, "namespace", cfg, ("n_measurements", "n_codes"), "n_namespaces"
-        ),
     }
 
 
 def _ontology_block(
     meds_dir: Path,
     by_vocabulary: pl.DataFrame | None,
+    unmapped: pl.DataFrame | None,
+    observed_codes: set[str],
+    n_total_measurements: int | None,
     cfg: ExtractConfig,
 ) -> dict[str, Any]:
     """Summarize the external ontologies that ``parent_codes`` links into.
 
-    Parent codes name concepts in published terminologies -- LOINC, SNOMED, ICD -- so unlike the
-    dataset's own vocabulary they carry no information about who is in the dataset. That makes them
-    the one place this package can report identifiers rather than digests, and they are a strong ETL
-    signal: a concept-mapping table that silently stops resolving shows up here as a vocabulary whose
-    link count collapsed, which no aggregate count elsewhere would reveal.
+    This is the only axis along which the vocabulary is partitioned, and the reason it is the only
+    one: ``parent_codes`` entries name concepts in *published* terminologies -- LOINC, SNOMED, ICD --
+    so the grouping is declared by the dataset rather than guessed from the shape of its code
+    strings, and the group names are properties of the terminology rather than of any patient. It
+    therefore does double duty. It answers "*where* did the vocabulary change?", which is what
+    someone debugging a failed comparison needs, and it is a strong ETL signal in its own right: a
+    concept-mapping table that silently stops resolving shows up here as a vocabulary whose link
+    count collapsed, or as a jump in unmapped measurement volume, while every count over the data
+    itself stays exactly the same.
 
     Suppression still applies to the *statistics*: a vocabulary reached by too few subjects is rolled
     up rather than reported, because its measurement count would otherwise describe a tiny cohort.
+    The ``coverage`` figures are global ratios and counts, so they are always reported.
 
     Args:
         meds_dir: The MEDS dataset root.
         by_vocabulary: Collected per-vocabulary data aggregate, or ``None`` if unavailable.
+        unmapped: Collected aggregate over measurements whose code has no parents, or ``None``.
+        observed_codes: Codes actually present in the data, for the coverage figures.
+        n_total_measurements: Total measurements in the dataset, or ``None`` if unavailable. Mapped
+            volume is derived from this rather than summed across vocabularies, because a code with
+            parents in two vocabularies contributes to both and the sum would exceed the total.
         cfg: Extraction configuration.
 
     Returns:
@@ -876,11 +862,14 @@ def _ontology_block(
         >>> by_vocab = pl.DataFrame({
         ...     "vocabulary": ["LOINC", "SNOMED"],
         ...     "n_measurements": [500, 20], "n_subjects": [50, 2], "n_child_codes": [2, 1],
+        ...     "numeric_n_finite": [480, 0], "numeric_mean": [88.5, None], "numeric_std": [12.25, None],
         ... })
+        >>> unmapped = pl.DataFrame([{"n_measurements": 40}])
         >>> with yaml_disk(spec) as d:
-        ...     block = _ontology_block(d, by_vocab, ExtractConfig(min_cell_size=20))
-        >>> pprint({k: v for k, v in block.items() if k != "by_vocabulary"})
-        {'frac_codes_with_parents': 0.666667,
+        ...     block = _ontology_block(d, by_vocab, unmapped, {"HR", "GLU", "X"}, 540,
+        ...                             ExtractConfig(min_cell_size=20))
+        >>> pprint({k: v for k, v in block.items() if k not in ("by_vocabulary", "coverage")})
+        {'n_codes_in_multiple_vocabularies': 1,
          'n_codes_with_parents': 2,
          'n_distinct_parents': 3,
          'n_parent_links': 3,
@@ -888,10 +877,24 @@ def _ontology_block(
          'n_vocabularies': 2,
          'n_vocabularies_recognized': 2,
          'parents_per_code': {'n': 3, 'suppressed': True},
-         'present': True}
+         'present': True,
+         'vocabularies_per_code': {'n': 3, 'suppressed': True}}
 
-        LOINC clears the subject floor and is reported by name, with a digest of its key set. SNOMED,
-        reached by only two subjects, is rolled up -- its name is withheld along with its counts:
+        Coverage is where an unresolved mapping table shows up. These are dataset-level ratios, so
+        they are never suppressed:
+
+        >>> pprint(block["coverage"])
+        {'frac_measurements_mapped': 0.925926,
+         'frac_observed_codes_with_parents': 0.666667,
+         'n_measurements_mapped': 500,
+         'n_measurements_unmapped': 40,
+         'n_observed_codes': 3,
+         'n_observed_codes_with_parents': 2,
+         'n_observed_codes_without_parents': 1}
+
+        LOINC clears the subject floor and is reported by name, with digests of its key set and its
+        numeric moments. SNOMED, reached by only two subjects, is rolled up -- its name is withheld
+        along with its counts:
 
         >>> pprint(block["by_vocabulary"])
         {'<suppressed>': {'n_child_codes': 1,
@@ -902,13 +905,14 @@ def _ontology_block(
                    'n_distinct_keys': 2,
                    'n_measurements': 500,
                    'n_subjects': 50,
+                   'numeric': {'mean': 88.5, 'n_finite': 480, 'std': 12.25},
                    'recognized': True}}
 
         With no code metadata at all, the block records its own absence rather than vanishing, so a
         later comparison can flag metadata that disappeared:
 
         >>> with yaml_disk({"data": {}}) as d:
-        ...     _ontology_block(d, None, ExtractConfig())
+        ...     _ontology_block(d, None, None, set(), None, ExtractConfig())
         {'present': False}
     """
     fp = meds_dir / meds.code_metadata_filepath
@@ -918,7 +922,6 @@ def _ontology_block(
     if "parent_codes" not in lf.collect_schema():
         return {"present": False}
 
-    n_codes = lf.select(pl.len()).collect().item()
     per_code_parents = lf.select("code", n_parents=pl.col("parent_codes").list.len().fill_null(0)).collect()
     links = (
         lf.select("code", "parent_codes")
@@ -928,6 +931,7 @@ def _ontology_block(
         .select("code", "parent_code", vocabulary_expr(), key_expr())
         .collect()
     )
+    per_code_vocabularies = links.group_by("code").agg(n_vocabularies=pl.col("vocabulary").n_unique())
 
     volumes = {r["vocabulary"]: r for r in by_vocabulary.to_dicts()} if by_vocabulary is not None else {}
     rows = []
@@ -944,22 +948,55 @@ def _ontology_block(
             "n_subjects": volume.get("n_subjects"),
             "keys_digest": digest(keys),
         }
+        if (volume.get("numeric_n_finite") or 0) >= cfg.min_numeric_cell_size:
+            row["numeric"] = {
+                "n_finite": volume["numeric_n_finite"],
+                "mean": _round_sig(volume["numeric_mean"]),
+                "std": _round_sig(volume["numeric_std"]),
+            }
         if cfg.emit_ontology_keys:
             row["keys"] = keys
         rows.append(row)
 
+    mapped_codes = set(links["code"].to_list())
+    n_observed = len(observed_codes)
+    n_observed_mapped = len(observed_codes & mapped_codes)
+    n_unmapped = int(unmapped["n_measurements"][0]) if unmapped is not None else None
+    # Derived, not summed: a code with parents in two vocabularies appears under both, so summing
+    # `by_vocabulary` would double-count it and could push the fraction above 1.
+    n_mapped = (
+        None if n_unmapped is None or n_total_measurements is None else n_total_measurements - n_unmapped
+    )
+
     return {
         "present": True,
         "n_codes_with_parents": int((per_code_parents["n_parents"] > 0).sum()),
-        "frac_codes_with_parents": _round_sig(
-            int((per_code_parents["n_parents"] > 0).sum()) / n_codes if n_codes else None
-        ),
         "n_parent_links": links.height,
         "n_distinct_parents": links["parent_code"].n_unique(),
         "n_parents_without_vocabulary": int((links["vocabulary"] == NO_VOCABULARY).sum()),
         "n_vocabularies": links["vocabulary"].n_unique(),
         "n_vocabularies_recognized": sum(1 for r in rows if r["recognized"]),
+        "n_codes_in_multiple_vocabularies": int((per_code_vocabularies["n_vocabularies"] > 1).sum()),
         "parents_per_code": _distribution(per_code_parents["n_parents"].cast(pl.Float64), cfg),
+        "vocabularies_per_code": _distribution(
+            per_code_parents.join(per_code_vocabularies, on="code", how="left")["n_vocabularies"]
+            .fill_null(0)
+            .cast(pl.Float64),
+            cfg,
+        ),
+        "coverage": {
+            "n_observed_codes": n_observed,
+            "n_observed_codes_with_parents": n_observed_mapped,
+            "n_observed_codes_without_parents": n_observed - n_observed_mapped,
+            "frac_observed_codes_with_parents": _round_sig(
+                n_observed_mapped / n_observed if n_observed else None
+            ),
+            "n_measurements_mapped": n_mapped,
+            "n_measurements_unmapped": n_unmapped,
+            "frac_measurements_mapped": _round_sig(
+                n_mapped / n_total_measurements if n_mapped is not None and n_total_measurements else None
+            ),
+        },
         "by_vocabulary": _suppress_keyed(
             rows, "vocabulary", cfg, ("n_measurements", "n_child_codes"), "n_vocabularies"
         ),
@@ -970,6 +1007,8 @@ def _code_metadata_block(
     meds_dir: Path,
     per_code: pl.DataFrame,
     by_vocabulary: pl.DataFrame | None,
+    unmapped: pl.DataFrame | None,
+    n_total_measurements: int | None,
     cfg: ExtractConfig,
 ) -> dict[str, Any]:
     """Summarize ``metadata/codes.parquet`` and its agreement with the observed data.
@@ -989,7 +1028,7 @@ def _code_metadata_block(
         ... }}}
         >>> observed = pl.DataFrame({"code": ["HR", "GLU", "NOT_IN_METADATA"]})
         >>> with yaml_disk(spec) as d:
-        ...     block = _code_metadata_block(d, observed, None, ExtractConfig())
+        ...     block = _code_metadata_block(d, observed, None, None, None, ExtractConfig())
         >>> pprint({k: v for k, v in block.items() if k not in ("ontology", "description_length")})
         {'n_codes': 3,
          'n_data_codes_missing_from_metadata': 1,
@@ -1000,7 +1039,7 @@ def _code_metadata_block(
          'vocabulary_digest': 'sha256:...'}
 
         >>> with yaml_disk({"data": {}}) as d:
-        ...     _code_metadata_block(d, observed, None, ExtractConfig())
+        ...     _code_metadata_block(d, observed, None, None, None, ExtractConfig())
         {'present': False}
     """
     fp = meds_dir / meds.code_metadata_filepath
@@ -1033,7 +1072,9 @@ def _code_metadata_block(
     if "description" in schema:
         lengths = lf.select(pl.col("description").str.len_chars()).collect()["description"]
         block["description_length"] = _distribution(lengths.cast(pl.Float64), cfg)
-    block["ontology"] = _ontology_block(meds_dir, by_vocabulary, cfg)
+    block["ontology"] = _ontology_block(
+        meds_dir, by_vocabulary, unmapped, observed_codes, n_total_measurements, cfg
+    )
     return block
 
 
@@ -1278,23 +1319,39 @@ def extract_summary_stats(meds_dir: str | Path, cfg: ExtractConfig | None = None
         survive -- which is the behavior that matters: a small dataset yields a fingerprint that is
         still comparable but discloses nothing.
 
-        >>> stats["codes"]["by_namespace"]
-        {'<suppressed>': {'n_codes': 11, 'n_measurements': 62, 'n_namespaces': 3}}
         >>> stats["splits"]["by_split"]
         {'<suppressed>': {'n_measurements': 62, 'n_splits': 3}}
+        >>> stats["code_metadata"]["ontology"]["by_vocabulary"]
+        {'<suppressed>': {'n_child_codes': 2, 'n_measurements': 32, 'n_vocabularies': 1}}
         >>> stats["codes"]["digests"]["alphabetical"]
         'sha256:...'
 
+        The vocabulary is never partitioned by the shape of the code strings, so there is no
+        namespace view to suppress in the first place -- only digests and aggregate distributions:
+
+        >>> sorted(stats["codes"])
+        ['concentration', 'digests', 'n_codes_below_min_cell_size', 'n_unique_codes', 'occurrence']
+
         Lowering the floor to 1 makes the same dataset fully legible, which is how the tool is meant
-        to be used on data that is already public:
+        to be used on data that is already public. The ontology view is the axis that says *where*
+        something changed, and its groups come from the dataset's own ``parent_codes``:
 
         >>> stats = extract_summary_stats(simple_static_MEDS, ExtractConfig(min_cell_size=1))
-        >>> sorted(stats["codes"]["by_namespace"])
-        ['<no-namespace>', 'ADMISSION', 'EYE_COLOR']
         >>> sorted(stats["splits"]["by_split"])
         ['held_out', 'train', 'tuning']
         >>> stats["splits"]["by_split"]["train"]
         {'n_measurements': 44, 'n_subjects': 4}
+        >>> sorted(stats["code_metadata"]["ontology"]["by_vocabulary"])
+        ['LOINC']
+
+        Coverage reports how much of the data the ontology actually reaches, which is how an
+        unresolved mapping table announces itself:
+
+        >>> coverage = stats["code_metadata"]["ontology"]["coverage"]
+        >>> coverage["n_observed_codes"], coverage["n_observed_codes_without_parents"]
+        (11, 9)
+        >>> coverage["frac_measurements_mapped"]
+        0.516129
 
         No code string appears anywhere in the document, at any threshold:
 
@@ -1328,8 +1385,15 @@ def extract_summary_stats(meds_dir: str | Path, cfg: ExtractConfig | None = None
         "per_subject": _per_subject_block(per_subject, cfg),
         "time": _time_block(frames["by_year"], frames.get("time_quantiles"), cfg),
         "splits": _splits_block(meds_dir, per_subject, cfg),
-        "codes": _codes_block(per_code, frames["by_namespace"], cfg),
-        "code_metadata": _code_metadata_block(meds_dir, per_code, frames.get("by_vocabulary"), cfg),
+        "codes": _codes_block(per_code, cfg),
+        "code_metadata": _code_metadata_block(
+            meds_dir,
+            per_code,
+            frames.get("by_vocabulary"),
+            frames.get("unmapped"),
+            int(frames["overall"]["n_measurements"][0]),
+            cfg,
+        ),
     }
 
     if (numeric_quantiles := frames.get("numeric_quantiles")) is not None:

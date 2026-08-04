@@ -50,9 +50,13 @@ Three invariants hold everywhere in `extract.py`, and each is covered by a hypot
 `tests/test_properties.py`:
 
 1. **No code string is ever emitted.** Not at any suppression threshold, not under any flag. If you
-    add a field, ask whether an adversary could read a code out of it. Note the subtle case already
-    handled: codes without a `//` namespace are pooled under `<no-namespace>` precisely because for
-    a flat vocabulary the namespace *is* the code.
+    add a field, ask whether an adversary could read a code out of it.
+    **Do not partition the vocabulary by the shape of the code strings.** Splitting on the `//`
+    convention is tempting and is deliberately absent: MEDS does not require it, so the axis would
+    be present on some datasets and silently missing on others, and for a flat vocabulary the
+    prefix *is* the code, so the prefix list would be the vocabulary. `parent_codes` is the only
+    sanctioned grouping axis, because those groups are declared rather than inferred.
+    `tests/test_integration.py::test_the_slash_slash_convention_is_never_interpreted` guards this.
 2. **No keyed cell below `min_cell_size` distinct subjects.** Route new keyed blocks through
     `_suppress_keyed` rather than filtering by hand.
 3. **No `min` or `max`, anywhere.** Use quantiles. This is not negotiable for a new statistic.

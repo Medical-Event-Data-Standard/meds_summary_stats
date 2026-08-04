@@ -219,6 +219,21 @@ DEFAULT_RULES: tuple[dict[str, Any], ...] = (
     {"path": "code_metadata.vocabulary_digest", "kind": "exact"},
     {"path": "code_metadata.ontology.by_vocabulary.*.keys_digest", "kind": "exact"},
     {"path": "code_metadata.ontology.by_vocabulary.*.recognized", "kind": "exact"},
+    # Ontology coverage is the axis that says *where* the vocabulary moved, and a mapping table
+    # that stops resolving shows up here and nowhere else.
+    {
+        "path": "code_metadata.ontology.coverage.frac_measurements_mapped",
+        "kind": "relative",
+        "warn": 0.0,
+        "error": 0.01,
+    },
+    {
+        "path": "code_metadata.ontology.coverage.n_observed_codes_without_parents",
+        "kind": "relative",
+        "warn": 0.0,
+        "error": 0.05,
+    },
+    {"path": "code_metadata.ontology.n_vocabularies", "kind": "exact"},
     # Referential integrity between the data and its metadata.
     {"path": "code_metadata.n_data_codes_missing_from_metadata", "kind": "absolute", "error": 0},
     {"path": "splits.n_subjects_in_data_without_split", "kind": "absolute", "error": 0},

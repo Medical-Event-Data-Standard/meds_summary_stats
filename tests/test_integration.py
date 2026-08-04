@@ -14,6 +14,7 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import polars as pl
@@ -23,6 +24,7 @@ from meds_summary_stats.cli import EXIT_INPUT_ERROR, EXIT_REGRESSION, compare_ma
 from meds_summary_stats.compare import compare_summary_stats
 from meds_summary_stats.config import SUPPRESSED, ExtractConfig
 from meds_summary_stats.extract import extract_summary_stats, read_summary_stats, write_summary_stats
+from meds_summary_stats.flatten import flatten
 from meds_summary_stats.policy import ComparePolicy
 
 
@@ -183,7 +185,6 @@ def test_suppression_holds_over_a_realistic_dataset(generated_sample_MEDS: Path)
     stats = extract_summary_stats(generated_sample_MEDS, cfg)
 
     keyed_blocks = [
-        stats["codes"]["by_namespace"],
         stats["splits"]["by_split"],
         stats["time"]["by_year"],
         stats["code_metadata"]["ontology"].get("by_vocabulary", {}),
@@ -344,3 +345,97 @@ def test_compare_main_writes_both_report_formats(generated_sample_MEDS: Path, tm
     assert report["failed"] is True
     assert any(f["path"] == "counts.n_measurements" for f in report["findings"])
     assert "| Path | Baseline | Current | Detail |" in (tmp_path / "nested" / "report.md").read_text()
+
+
+def test_the_slash_slash_convention_is_never_interpreted(tmp_path: Path):
+    """Two datasets identical except for a ``//`` prefix on every code must have the same shape.
+
+    MEDS does not require the ``//`` namespace convention, so nothing in the emitted document may
+    depend on it. A tool that split codes on ``//`` would produce an extra grouping axis for the
+    prefixed dataset and not for the flat one, and the two documents would differ structurally.
+    They must differ only in the digests, which depend on the code strings themselves.
+    """
+
+    def build(root: Path, prefix: str) -> Path:
+        (root / "data").mkdir(parents=True)
+        (root / "metadata").mkdir(parents=True)
+        pl.DataFrame(
+            {
+                "subject_id": [i // 4 for i in range(400)],
+                "time": [datetime(2020, 1, 1 + (i % 28)) for i in range(400)],
+                "code": [f"{prefix}CODE_{i % 5}" for i in range(400)],
+                "numeric_value": [float(i % 17) for i in range(400)],
+            },
+            schema={
+                "subject_id": pl.Int64,
+                "time": pl.Datetime("us"),
+                "code": pl.String,
+                "numeric_value": pl.Float32,
+            },
+        ).write_parquet(root / "data" / "0.parquet")
+        pl.DataFrame(
+            {"code": [f"{prefix}CODE_{i}" for i in range(5)], "parent_codes": [None] * 5},
+            schema={"code": pl.String, "parent_codes": pl.List(pl.String)},
+        ).write_parquet(root / "metadata" / "codes.parquet")
+        return root
+
+    flat = extract_summary_stats(build(tmp_path / "flat", ""))
+    prefixed = extract_summary_stats(build(tmp_path / "prefixed", "LAB//"))
+
+    for stats in (flat, prefixed):
+        stats.pop("extracted_at")
+
+    flat_paths = set(flatten(flat))
+    prefixed_paths = set(flatten(prefixed))
+    assert flat_paths == prefixed_paths, sorted(flat_paths ^ prefixed_paths)
+
+    differing = {path for path in flat_paths if flatten(flat)[path] != flatten(prefixed)[path]}
+    assert differing, "prefixing every code should at least change the vocabulary digests"
+    assert all("digest" in path for path in differing), sorted(differing)
+
+
+def test_mapping_coverage_is_bounded_when_codes_span_vocabularies(tmp_path: Path):
+    """A code with parents in several vocabularies must not inflate the mapped fraction.
+
+    Per-vocabulary measurement counts deliberately over-sum: a code mapped into both LOINC and
+    SNOMED contributes its full volume to each. Deriving ``n_measurements_mapped`` by summing those
+    would therefore exceed the dataset total and push ``frac_measurements_mapped`` above 1, so it is
+    derived from the unmapped count instead.
+    """
+    (tmp_path / "data").mkdir(parents=True)
+    (tmp_path / "metadata").mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "subject_id": [i // 2 for i in range(200)],
+            "time": [None] * 200,
+            "code": [f"C{i % 4}" for i in range(200)],
+            "numeric_value": [float(i) for i in range(200)],
+        },
+        schema={
+            "subject_id": pl.Int64,
+            "time": pl.Datetime("us"),
+            "code": pl.String,
+            "numeric_value": pl.Float32,
+        },
+    ).write_parquet(tmp_path / "data" / "0.parquet")
+    pl.DataFrame(
+        {
+            "code": ["C0", "C1", "C2", "C3"],
+            "parent_codes": [["LOINC/1", "SNOMED/1"], ["LOINC/2", "SNOMED/2"], ["LOINC/3"], None],
+        },
+        schema={"code": pl.String, "parent_codes": pl.List(pl.String)},
+    ).write_parquet(tmp_path / "metadata" / "codes.parquet")
+
+    stats = extract_summary_stats(tmp_path, ExtractConfig(min_cell_size=1, min_numeric_cell_size=1))
+    ontology = stats["code_metadata"]["ontology"]
+    coverage = ontology["coverage"]
+
+    assert coverage["n_measurements_mapped"] == 150
+    assert coverage["n_measurements_unmapped"] == 50
+    assert coverage["frac_measurements_mapped"] == 0.75
+    assert 0.0 <= coverage["frac_measurements_mapped"] <= 1.0
+
+    per_vocabulary = {k: v["n_measurements"] for k, v in ontology["by_vocabulary"].items()}
+    assert per_vocabulary == {"LOINC": 150, "SNOMED": 100}
+    assert sum(per_vocabulary.values()) > stats["counts"]["n_measurements"]
+    assert ontology["n_codes_in_multiple_vocabularies"] == 2

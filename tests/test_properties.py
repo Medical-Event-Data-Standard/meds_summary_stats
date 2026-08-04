@@ -31,8 +31,9 @@ from meds_summary_stats.extract import extract_summary_stats
 from meds_summary_stats.flatten import escape, flatten, matches, specificity
 from meds_summary_stats.ontology import key_expr, split_parent_code, vocabulary_expr
 
-# Codes are drawn to look like real MEDS vocabularies: some namespaced, some flat, with the
-# separator characters that the namespace and vocabulary parsers key on.
+# Codes are drawn to look like real MEDS vocabularies: some carrying the `//` convention many ETLs
+# use, some entirely flat. Nothing in the package may treat those two shapes differently -- MEDS
+# does not require the convention -- so the strategy deliberately mixes them.
 _CODE_ALPHABET = string.ascii_uppercase + string.digits + "_-."
 codes = st.one_of(
     st.text(_CODE_ALPHABET, min_size=1, max_size=8),
@@ -88,14 +89,16 @@ def meds_datasets(draw, min_subjects: int = 1, max_subjects: int = 40):
 
 
 def _rename(code: str, index: int) -> str:
-    """Rewrite a code to a fresh, unique name, preserving its ``//`` namespace.
+    """Rewrite a code to a fresh, unique name.
+
+    The whole string is replaced, including any ``//`` prefix. Nothing in the emitted document may
+    depend on the internal structure of a code, so nothing needs preserving.
 
     Examples:
         >>> _rename("LAB//GLUCOSE", 0), _rename("HR", 1)
-        ('LAB//RENAMED0', 'RENAMED1')
+        ('RENAMED0', 'RENAMED1')
     """
-    namespace, separator, _ = code.partition("//")
-    return f"{namespace}{separator}RENAMED{index}" if separator else f"RENAMED{index}"
+    return f"RENAMED{index}"
 
 
 def _write(tmp_path, rows, code_rows, n_shards):
@@ -146,9 +149,9 @@ class TestPrivacyInvariants:
 
         Rename-invariance has no such ambiguity. If a code reached a key or a string value, changing
         the code would change the document's *shape*; if it only reached a digest, the shape is
-        identical and only values move. Namespaces are renamed alongside nothing -- the part before
-        ``//`` is preserved, since namespaces are legitimately emitted and the codes within them are
-        not.
+        identical and only values move. The whole code is replaced, including any ``//`` prefix:
+        MEDS does not require that convention, so nothing in the document is permitted to depend on
+        it, and a rename that preserved it would not test that.
 
         Run with the floor at 1 (suppression effectively disabled), because the guarantee must be
         structural. If it only held because the floor happened to be high, it would not be a
@@ -194,7 +197,6 @@ class TestPrivacyInvariants:
         stats = extract_summary_stats(root, ExtractConfig(min_cell_size=floor))
 
         blocks = [
-            stats["codes"]["by_namespace"],
             stats["time"]["by_year"],
             stats["code_metadata"]["ontology"].get("by_vocabulary", {}),
         ]
