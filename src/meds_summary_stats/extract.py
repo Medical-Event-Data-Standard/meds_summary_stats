@@ -23,7 +23,7 @@ import polars as pl
 
 from . import __version__
 from .config import NO_VOCABULARY, SUPPRESSED, ExtractConfig
-from .digests import digest, format_moment, ordered_by
+from .digests import combine_digests, digest, file_digest, format_moment, ordered_by
 from .ontology import is_recognized, key_expr, vocabulary_expr
 
 #: Version of the emitted stats document format.
@@ -439,6 +439,167 @@ def _layout(meds_dir: Path, shards: list[Path]) -> dict[str, Any]:
     }
 
 
+#: Maximum number of files for which per-file digests are listed individually.
+_MAX_FILES_LISTED = 64
+
+
+def _schema_files(meds_dir: Path) -> dict[str, list[Path]]:
+    """Group the files the MEDS schema defines, ignoring everything else in the directory.
+
+    "Everything else" is deliberate. A MEDS root routinely carries task labels, cached
+    intermediates, notes, and editor droppings, none of which are part of the dataset and none of
+    which should make two datasets compare unequal.
+
+    Args:
+        meds_dir: The MEDS dataset root.
+
+    Returns:
+        Paths grouped by role: ``data``, ``code_metadata``, ``subject_splits``, ``dataset_metadata``.
+
+    Examples:
+        >>> spec = {
+        ...     "data": {"train": {"0.parquet": {"subject_id": [1]}},
+        ...              "notes.txt": "not part of the schema"},
+        ...     "metadata": {"codes.parquet": {"code": ["A"]}, "scratch.json": {"ignored": True}},
+        ...     "README.md": "also ignored",
+        ... }
+        >>> with yaml_disk(spec) as d:
+        ...     {role: [p.relative_to(d).as_posix() for p in paths]
+        ...      for role, paths in _schema_files(d).items()}
+        {'data': ['data/train/0.parquet'], 'code_metadata': ['metadata/codes.parquet'],
+         'subject_splits': [], 'dataset_metadata': []}
+    """
+    optional = {
+        "code_metadata": meds_dir / meds.code_metadata_filepath,
+        "subject_splits": meds_dir / meds.subject_splits_filepath,
+        "dataset_metadata": meds_dir / meds.dataset_metadata_filepath,
+    }
+    grouped: dict[str, list[Path]] = {"data": sorted((meds_dir / meds.data_subdirectory).rglob("*.parquet"))}
+    grouped.update({role: ([path] if path.is_file() else []) for role, path in optional.items()})
+    return grouped
+
+
+def _dataset_digest_block(meds_dir: Path, cfg: ExtractConfig) -> dict[str, Any]:
+    """Checksum the dataset, so two extractions can assert byte-level identity.
+
+    Summary statistics answer "did anything I measure change?". This answers the stronger and much
+    simpler question "is this the same dataset at all?", which is what you want when pinning a
+    dataset version: at ``dataset_version: 3.1`` you should get exactly this digest, and any
+    deviation is worth a look before you even read the statistics.
+
+    What it covers and what it does not:
+
+    * Only files the MEDS schema defines. Task labels, caches, and stray files in the root are
+      ignored, so they cannot make two copies of the same dataset compare unequal.
+    * ``metadata/dataset.json`` is digested separately and left out of ``combined``, because it
+      carries ``created_at`` and ``etl_version`` -- fields that change on every run by design.
+      Folding them in would make the combined digest change every time and mean nothing.
+    * ``combined`` hashes the *set* of file contents, not their paths, so renaming or re-nesting
+      shards without changing their contents leaves it unchanged. Shard naming is tracked
+      separately by ``layout.shard_names_digest``.
+
+    This is a digest of *bytes*, which makes it the strictest available identity check and also
+    means it is sensitive to re-encoding: the same rows rewritten by a different parquet writer, or
+    with different compression or row-group sizes, produce a different digest. When that happens
+    the digest moves while every statistic stays put, and that combination is itself the diagnosis.
+
+    Args:
+        meds_dir: The MEDS dataset root.
+        cfg: Extraction configuration.
+
+    Returns:
+        The ``dataset_digest`` block, or ``{"method": "none"}`` when disabled.
+
+    Examples:
+        >>> from pprint import pprint
+        >>> spec = {
+        ...     "data": {"0.parquet": {"subject_id": [1], "code": ["A"]}},
+        ...     "metadata": {"codes.parquet": {"code": ["A"]},
+        ...                  "dataset.json": {"dataset_version": "1.0"}},
+        ... }
+        >>> with yaml_disk(spec) as d:
+        ...     block = _dataset_digest_block(d, ExtractConfig())
+        >>> pprint(block)
+        {'by_file': {'data/0.parquet': 'sha256:...',
+                     'metadata/codes.parquet': 'sha256:...'},
+         'code_metadata': 'sha256:...',
+         'combined': 'sha256:...',
+         'data': {'digest': 'sha256:...', 'n_files': 1},
+         'dataset_metadata': 'sha256:...',
+         'method': 'files',
+         'n_files': 3,
+         'subject_splits': None}
+
+        ``yaml_disk`` is a singleton whose context manager tears down the previous root, so each
+        variant below is written and digested one at a time rather than in a shared ``with``:
+
+        >>> def digest_of(contents):
+        ...     with yaml_disk(contents) as root:
+        ...         return _dataset_digest_block(root, ExtractConfig())
+
+        Two byte-identical datasets agree, and a one-row change disagrees:
+
+        >>> changed = {**spec, "data": {"0.parquet": {"subject_id": [2], "code": ["A"]}}}
+        >>> digest_of(spec)["combined"] == digest_of(spec)["combined"]
+        True
+        >>> digest_of(spec)["combined"] == digest_of(changed)["combined"]
+        False
+
+        A file outside the MEDS schema cannot affect it:
+
+        >>> noisy = {**spec, "scratch.txt": "irrelevant", "labels": {"task.parquet": {"x": [1]}}}
+        >>> digest_of(spec)["combined"] == digest_of(noisy)["combined"]
+        True
+
+        Neither can ``dataset.json``, which is why it is excluded -- an ETL rerun bumps its
+        ``created_at`` and would otherwise invalidate the digest every time:
+
+        >>> rerun = {**spec, "metadata": {"codes.parquet": {"code": ["A"]},
+        ...                               "dataset.json": {"dataset_version": "1.0",
+        ...                                                "created_at": "2026-08-04T00:00:00"}}}
+        >>> digest_of(spec)["combined"] == digest_of(rerun)["combined"]
+        True
+        >>> digest_of(spec)["dataset_metadata"] == digest_of(rerun)["dataset_metadata"]
+        False
+
+        >>> with yaml_disk(spec) as d:
+        ...     _dataset_digest_block(d, ExtractConfig(dataset_digest="none"))
+        {'method': 'none'}
+    """
+    if cfg.dataset_digest == "none":
+        return {"method": "none"}
+
+    grouped = _schema_files(meds_dir)
+    per_file = {
+        path.relative_to(meds_dir).as_posix(): file_digest(path)
+        for paths in grouped.values()
+        for path in paths
+    }
+
+    def role_digest(role: str) -> str | None:
+        paths = grouped[role]
+        if not paths:
+            return None
+        return combine_digests(per_file[p.relative_to(meds_dir).as_posix()] for p in paths)
+
+    # `combined` covers the data and the metadata that describes it, but not dataset.json.
+    combined_roles = ("data", "code_metadata", "subject_splits")
+    combined_source = [
+        per_file[p.relative_to(meds_dir).as_posix()] for role in combined_roles for p in grouped[role]
+    ]
+
+    return {
+        "method": "files",
+        "n_files": len(per_file),
+        "combined": combine_digests(combined_source),
+        "data": {"n_files": len(grouped["data"]), "digest": role_digest("data")},
+        "code_metadata": role_digest("code_metadata"),
+        "subject_splits": role_digest("subject_splits"),
+        "dataset_metadata": role_digest("dataset_metadata"),
+        "by_file": dict(sorted(per_file.items())) if len(per_file) <= _MAX_FILES_LISTED else None,
+    }
+
+
 def _base_frame(shards: list[Path], available: set[str]) -> pl.LazyFrame:
     """Build the normalized lazy frame every aggregate reads from.
 
@@ -547,6 +708,13 @@ def _code_vocabulary_map(meds_dir: Path) -> pl.LazyFrame | None:
         └──────┴────────────┘
 
         >>> with yaml_disk({"data": {}}) as d:
+        ...     _code_vocabulary_map(d) is None
+        True
+
+        Code metadata without a ``parent_codes`` column carries no ontology linkage, so there is
+        nothing to map:
+
+        >>> with yaml_disk({"metadata": {"codes.parquet": {"code": ["HR"]}}}) as d:
         ...     _code_vocabulary_map(d) is None
         True
     """
@@ -914,6 +1082,29 @@ def _ontology_block(
         >>> with yaml_disk({"data": {}}) as d:
         ...     _ontology_block(d, None, None, set(), None, ExtractConfig())
         {'present': False}
+
+        As does code metadata that exists but declares no ``parent_codes`` column:
+
+        >>> with yaml_disk({"metadata": {"codes.parquet": {"code": ["HR"]}}}) as d:
+        ...     _ontology_block(d, None, None, {"HR"}, 10, ExtractConfig())
+        {'present': False}
+
+        With ``emit_ontology_keys``, each reported vocabulary also lists its keys in full. Those
+        name published terminology concepts, so this is off by default for output size rather than
+        for privacy:
+
+        >>> spec = {"metadata": {"codes.parquet": {
+        ...     "code": ["HR"], "parent_codes": [["LOINC/8867-4", "LOINC/8310-5"]],
+        ... }}}
+        >>> volumes = pl.DataFrame([{"vocabulary": "LOINC", "n_measurements": 500,
+        ...                          "n_subjects": 50, "n_child_codes": 1,
+        ...                          "numeric_n_finite": 0, "numeric_mean": None,
+        ...                          "numeric_std": None}])
+        >>> with yaml_disk(spec) as d:
+        ...     keyed = _ontology_block(d, volumes, None, {"HR"}, 500,
+        ...                             ExtractConfig(min_cell_size=20, emit_ontology_keys=True))
+        >>> keyed["by_vocabulary"]["LOINC"]["keys"]
+        ['8310-5', '8867-4']
     """
     fp = meds_dir / meds.code_metadata_filepath
     if not fp.is_file():
@@ -1305,8 +1496,16 @@ def extract_summary_stats(meds_dir: str | Path, cfg: ExtractConfig | None = None
     Examples:
         >>> stats = extract_summary_stats(simple_static_MEDS)
         >>> sorted(stats)
-        ['code_metadata', 'codes', 'config', 'counts', 'dataset', 'extracted_at', 'layout',
-         'meds_summary_stats_version', 'per_subject', 'splits', 'stats_schema_version', 'time']
+        ['code_metadata', 'codes', 'config', 'counts', 'dataset', 'dataset_digest', 'extracted_at',
+         'layout', 'meds_summary_stats_version', 'per_subject', 'splits', 'stats_schema_version',
+         'time']
+
+        The digest answers "is this the same dataset at all?", independently of every statistic:
+
+        >>> stats["dataset_digest"]["method"], stats["dataset_digest"]["n_files"]
+        ('files', 7)
+        >>> stats["dataset_digest"]["combined"]
+        'sha256:...'
 
         The sample dataset has six subjects across four shards:
 
@@ -1380,6 +1579,7 @@ def extract_summary_stats(meds_dir: str | Path, cfg: ExtractConfig | None = None
         "extracted_at": _iso(datetime.datetime.now(tz=datetime.UTC).replace(tzinfo=None)),
         "config": cfg.to_dict(),
         "dataset": {"present": dataset_present, **dataset_metadata},
+        "dataset_digest": _dataset_digest_block(meds_dir, cfg),
         "layout": layout,
         "counts": _counts_block(frames["overall"], per_subject),
         "per_subject": _per_subject_block(per_subject, cfg),

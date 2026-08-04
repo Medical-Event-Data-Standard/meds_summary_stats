@@ -27,7 +27,7 @@ from .extract import (
     read_summary_stats,
     write_summary_stats,
 )
-from .policy import ComparePolicy
+from .policy import ComparePolicy, Severity  # noqa: F401  (Severity used in doctests)
 from .report import render_markdown, render_text
 
 #: Exit code for a comparison that failed its policy. Distinct from ``2``, which argparse uses for
@@ -76,6 +76,15 @@ def _extract_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--dataset-digest",
+        choices=("none", "files"),
+        default=_EXTRACT_DEFAULTS.dataset_digest,
+        help=(
+            "'files' (default) checksums the bytes of every file the MEDS schema defines, so two "
+            "extractions can assert the dataset is byte-identical; 'none' skips it."
+        ),
+    )
+    parser.add_argument(
         "--emit-ontology-keys",
         action="store_true",
         help="List every key observed in each external vocabulary referenced by parent_codes.",
@@ -107,6 +116,14 @@ def _resolve_extract_config(args: argparse.Namespace) -> ExtractConfig:
         ...     args = parser.parse_args(["/d", "-c", str(root / "c.yaml"), "--min-cell-size", "5"])
         ...     _resolve_extract_config(args).min_cell_size
         5
+
+        Every flag overrides independently:
+
+        >>> cfg = _resolve_extract_config(parser.parse_args(
+        ...     ["/d", "--numeric-detail", "quantiles", "--dataset-digest", "none",
+        ...      "--emit-ontology-keys"]))
+        >>> cfg.numeric_detail, cfg.dataset_digest, cfg.emit_ontology_keys
+        ('quantiles', 'none', True)
     """
     base = ExtractConfig.from_yaml(args.config) if args.config else ExtractConfig()
     overrides = {}
@@ -114,6 +131,8 @@ def _resolve_extract_config(args: argparse.Namespace) -> ExtractConfig:
         overrides["min_cell_size"] = args.min_cell_size
     if args.numeric_detail != _EXTRACT_DEFAULTS.numeric_detail:
         overrides["numeric_detail"] = args.numeric_detail
+    if args.dataset_digest != _EXTRACT_DEFAULTS.dataset_digest:
+        overrides["dataset_digest"] = args.dataset_digest
     if args.emit_ontology_keys:
         overrides["emit_ontology_keys"] = True
     return ExtractConfig.from_dict({**base.to_dict(), **overrides})
@@ -230,6 +249,20 @@ def _resolve_policy(args: argparse.Namespace) -> ComparePolicy:
         >>> args = parser.parse_args(["a", "b", "--on-dataset-version-change", "relax"])
         >>> _resolve_policy(args).on_dataset_version_change
         <DatasetVersionChangeAction.RELAX: 'relax'>
+
+        A policy file is loaded and then overridden by any flag the caller actually passed:
+
+        >>> spec = {"p.yaml": {"fail_on": "warning",
+        ...                    "rules": [{"path": "counts.n_subjects", "kind": "relative",
+        ...                               "error": 0.3}]}}
+        >>> with yaml_disk(spec) as root:
+        ...     from_file = _resolve_policy(parser.parse_args(["a", "b", "-c", str(root / "p.yaml")]))
+        ...     overridden = _resolve_policy(
+        ...         parser.parse_args(["a", "b", "-c", str(root / "p.yaml"), "--fail-on", "error"]))
+        >>> from_file.fail_on, from_file.rule_for("counts.n_subjects").error
+        (<Severity.WARNING: 'warning'>, 0.3)
+        >>> overridden.fail_on
+        <Severity.ERROR: 'error'>
     """
     raw: dict[str, object] = {}
     if args.config:

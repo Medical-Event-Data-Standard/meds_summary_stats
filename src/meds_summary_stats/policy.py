@@ -29,6 +29,34 @@ class Severity(enum.StrEnum):
         True
         >>> sorted([Severity.ERROR, Severity.INFO, Severity.WARNING])
         [<Severity.INFO: 'info'>, <Severity.WARNING: 'warning'>, <Severity.ERROR: 'error'>]
+
+        Severity *strings* compare by seriousness too, which matters because this is a ``StrEnum``
+        and callers naturally reach for the string form. Left to the base class these would compare
+        alphabetically and answer wrongly -- ``"error" < "warning"``, so ``Severity.ERROR >
+        "warning"`` would be ``False``:
+
+        >>> Severity.ERROR > "warning", Severity.INFO > "warning"
+        (True, False)
+        >>> Severity.WARNING >= "warning", Severity.WARNING <= "info"
+        (True, False)
+
+        A string that is not a severity at all is a mistake, and says so:
+
+        >>> Severity.ERROR > "banana"
+        Traceback (most recent call last):
+            ...
+        ValueError: 'banana' is not a valid Severity
+
+        As is comparing against a non-string:
+
+        >>> Severity.ERROR < 3
+        Traceback (most recent call last):
+            ...
+        TypeError: '<' not supported between instances of 'Severity' and 'int'
+        >>> Severity.ERROR >= None
+        Traceback (most recent call last):
+            ...
+        TypeError: '>=' not supported between instances of 'Severity' and 'NoneType'
     """
 
     INFO = "info"
@@ -39,29 +67,39 @@ class Severity(enum.StrEnum):
     def _rank(self) -> int:
         return ["info", "warning", "error"].index(self.value)
 
+    @staticmethod
+    def _rank_of(other: object) -> int | None:
+        """Rank whatever we are being compared against, or ``None`` if it is not a severity.
+
+        Severity strings are accepted and ranked by seriousness. Without this, the ``StrEnum`` base
+        would quietly answer with an *alphabetical* comparison -- ``Severity.ERROR > "warning"``
+        would be ``False``, because ``"e" < "w"`` -- which is a wrong answer rather than an error.
+        """
+        if isinstance(other, Severity):
+            return other._rank
+        if isinstance(other, str):
+            return Severity(other)._rank
+        return None
+
     def __lt__(self, other: object) -> bool:
         """Order by seriousness, so that ``max()`` over findings yields the worst one."""
-        if not isinstance(other, Severity):
-            return NotImplemented
-        return self._rank < other._rank
+        rank = self._rank_of(other)
+        return NotImplemented if rank is None else self._rank < rank
 
     def __gt__(self, other: object) -> bool:
         """Order by seriousness."""
-        if not isinstance(other, Severity):
-            return NotImplemented
-        return self._rank > other._rank
+        rank = self._rank_of(other)
+        return NotImplemented if rank is None else self._rank > rank
 
     def __le__(self, other: object) -> bool:
         """Order by seriousness."""
-        if not isinstance(other, Severity):
-            return NotImplemented
-        return self._rank <= other._rank
+        rank = self._rank_of(other)
+        return NotImplemented if rank is None else self._rank <= rank
 
     def __ge__(self, other: object) -> bool:
         """Order by seriousness."""
-        if not isinstance(other, Severity):
-            return NotImplemented
-        return self._rank >= other._rank
+        rank = self._rank_of(other)
+        return NotImplemented if rank is None else self._rank >= rank
 
 
 class Kind(enum.StrEnum):
@@ -90,6 +128,12 @@ class Rule:
         warn: Threshold above which a difference is a warning. ``None`` disables the warning tier.
         error: Threshold above which a difference is an error. ``None`` disables the error tier.
         on_change: Severity for an ``exact`` mismatch.
+        on_added: Severity when this path appears in the current document but not the baseline.
+            ``None`` defers to the policy's ``on_added_key``.
+        on_removed: Severity when this path is in the baseline but not the current document.
+            ``None`` defers to the policy's ``on_removed_key``. Override it where key churn is
+            routine rather than alarming -- per-shard file digests come and go whenever an ETL
+            changes its parallelism, which is not the same event as a statistic disappearing.
         relaxable: Whether a dataset-version change excuses this finding, under
             ``on_dataset_version_change: relax``. ``None`` means "decide by kind": numeric
             comparisons are excused, ``exact`` ones are not. Set it explicitly for the cases where
@@ -135,6 +179,8 @@ class Rule:
     warn: float | None = None
     error: float | None = None
     on_change: Severity = Severity.ERROR
+    on_added: Severity | None = None
+    on_removed: Severity | None = None
     relaxable: bool | None = None
 
     @property
@@ -168,10 +214,19 @@ class Rule:
             Traceback (most recent call last):
                 ...
             ValueError: Every rule needs a 'path'
+
+            A misspelled key is rejected rather than ignored -- a silently dropped ``errors`` would
+            leave the rule unable to fire while looking correct:
+
+            >>> Rule.from_dict({"path": "a.*", "kind": "relative", "errors": 0.1})
+            Traceback (most recent call last):
+                ...
+            ValueError: Unknown rule keys for path 'a.*': ['errors']
         """
         if "path" not in raw:
             raise ValueError("Every rule needs a 'path'")
-        if unknown := sorted(set(raw) - {"path", "kind", "warn", "error", "on_change", "relaxable"}):
+        known_keys = {"path", "kind", "warn", "error", "on_change", "on_added", "on_removed", "relaxable"}
+        if unknown := sorted(set(raw) - known_keys):
             raise ValueError(f"Unknown rule keys for path {raw['path']!r}: {unknown}")
         try:
             kind = Kind(raw.get("kind", "exact"))
@@ -185,6 +240,8 @@ class Rule:
             warn=raw.get("warn"),
             error=raw.get("error"),
             on_change=Severity(raw.get("on_change", "error")),
+            on_added=Severity(raw["on_added"]) if "on_added" in raw else None,
+            on_removed=Severity(raw["on_removed"]) if "on_removed" in raw else None,
             relaxable=raw.get("relaxable"),
         )
 
@@ -220,6 +277,24 @@ DEFAULT_RULES: tuple[dict[str, Any], ...] = (
     {"path": "dataset.created_at", "kind": "ignore"},
     {"path": "dataset.etl_version", "kind": "ignore"},
     {"path": "dataset.location_uri", "kind": "ignore"},
+    # The dataset checksum. Deliberately a warning rather than an error: it is a digest of bytes,
+    # so the same rows rewritten by a different parquet writer move it without the data having
+    # changed. When that happens the digest moves and every statistic stays put, which is itself
+    # the diagnosis. Promote it to `error` once you have confirmed your ETL is byte-reproducible.
+    {"path": "dataset_digest.**", "kind": "exact", "on_change": "warning"},
+    {"path": "dataset_digest.method", "kind": "exact"},
+    # Per-shard digests appear and disappear whenever an ETL changes its parallelism, which is a
+    # layout event rather than a data one -- `layout` reports it, and reporting it twice at error
+    # severity would just be noise.
+    {
+        "path": "dataset_digest.by_file.*",
+        "kind": "exact",
+        "on_change": "warning",
+        "on_added": "warning",
+        "on_removed": "warning",
+    },
+    # dataset.json carries created_at and etl_version, so its digest changes on every rerun.
+    {"path": "dataset_digest.dataset_metadata", "kind": "ignore"},
     # Identity and schema: any change is a regression until proven otherwise.
     {"path": "stats_schema_version", "kind": "exact"},
     {"path": "dataset.**", "kind": "exact"},

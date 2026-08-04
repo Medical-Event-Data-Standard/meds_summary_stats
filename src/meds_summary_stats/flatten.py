@@ -9,6 +9,7 @@ than a recursive special case.
 from __future__ import annotations
 
 import fnmatch
+import re
 from typing import Any
 
 #: Separator between path segments.
@@ -86,6 +87,40 @@ def flatten(document: Any, prefix: str = "") -> dict[str, Any]:
     return {prefix: document}
 
 
+#: Splits on separators that are not escaped, so a key containing a dot stays one segment.
+_UNESCAPED_SEP = re.compile(r"(?<!\\)" + re.escape(SEP))
+
+
+def split_path(path: str) -> list[str]:
+    r"""Split a flattened path into segments, honoring the escaping :func:`escape` applied.
+
+    Splitting on every ``.`` would undo the escaping and silently break any key containing one --
+    which is not hypothetical: every entry under ``dataset_digest.by_file`` is a filename ending in
+    ``.parquet``, and a rule written as ``dataset_digest.by_file.*`` would match none of them.
+
+    Args:
+        path: The flattened path to split.
+
+    Returns:
+        The path's segments.
+
+    Examples:
+        >>> split_path("counts.n_subjects")
+        ['counts', 'n_subjects']
+
+        An escaped dot does not split:
+
+        >>> split_path("dataset_digest.by_file.data/0\\.parquet")
+        ['dataset_digest', 'by_file', 'data/0\\.parquet']
+
+        Which is exactly what :func:`escape` produces, so the round trip is consistent:
+
+        >>> split_path("splits.by_split." + escape("v1.2"))
+        ['splits', 'by_split', 'v1\\.2']
+    """
+    return _UNESCAPED_SEP.split(path)
+
+
 def matches(path: str, pattern: str) -> bool:
     """Whether ``path`` matches a glob ``pattern``.
 
@@ -130,9 +165,7 @@ def matches(path: str, pattern: str) -> bool:
     """
     if pattern.endswith(f"{SEP}**") and path == pattern[: -len(f"{SEP}**")]:
         return True
-    path_parts = path.split(SEP)
-    pattern_parts = pattern.split(SEP)
-    return _match_parts(path_parts, pattern_parts)
+    return _match_parts(split_path(path), split_path(pattern))
 
 
 def _match_parts(path_parts: list[str], pattern_parts: list[str]) -> bool:

@@ -14,8 +14,9 @@ floor of 20 in place, and most of the keyed cells below would collapse into `<su
 >>> cfg = ExtractConfig(min_cell_size=1, min_numeric_cell_size=1)
 >>> stats = extract_summary_stats(simple_static_MEDS, cfg)
 >>> sorted(stats)
-['code_metadata', 'codes', 'config', 'counts', 'dataset', 'extracted_at', 'layout',
- 'meds_summary_stats_version', 'per_subject', 'splits', 'stats_schema_version', 'time']
+['code_metadata', 'codes', 'config', 'counts', 'dataset', 'dataset_digest', 'extracted_at',
+ 'layout', 'meds_summary_stats_version', 'per_subject', 'splits', 'stats_schema_version',
+ 'time']
 
 ```
 
@@ -271,6 +272,66 @@ in `metadata/codes.parquet`:
 
 (This particular fixture is deliberately incomplete; on a valid dataset the middle number is 0, and
 the default policy treats any nonzero value as an error.)
+
+## `dataset_digest` — "is this the same dataset at all?"
+
+Everything else on this page measures the data. This block asks the prior question, and answers it
+exactly: a sha256 over the bytes of every file the MEDS schema defines.
+
+```python
+>>> digest = stats["dataset_digest"]
+>>> digest["method"], digest["n_files"], digest["data"]["n_files"]
+('files', 7, 4)
+>>> digest["combined"]
+'sha256:...'
+
+```
+
+Three deliberate choices, each of which would otherwise make it useless:
+
+- **Only schema files count.** `data/**/*.parquet`, `metadata/codes.parquet`,
+    `metadata/subject_splits.parquet`, `metadata/dataset.json`. Task labels, caches, notes, and
+    editor droppings in the dataset root are ignored, so they cannot make two copies of the same
+    dataset compare unequal.
+- **`metadata/dataset.json` is excluded from `combined`.** It carries `created_at` and
+    `etl_version`, which change on every run by design; folding them in would invalidate the digest
+    every time and mean nothing. It gets its own `dataset_metadata` digest, which the default policy
+    ignores.
+- **`combined` hashes the set of file *contents*, not their paths.** Renaming or re-nesting a shard
+    without changing what is in it leaves it alone. Shard naming is tracked separately by
+    `layout.shard_names_digest`, so a rename is reported once, in the right place.
+
+```python
+>>> sorted(digest)
+['by_file', 'code_metadata', 'combined', 'data', 'dataset_metadata', 'method', 'n_files',
+ 'subject_splits']
+>>> sorted(digest["by_file"])
+['data/held_out/0.parquet', 'data/train/0.parquet', 'data/train/1.parquet',
+ 'data/tuning/0.parquet', 'metadata/codes.parquet', 'metadata/dataset.json',
+ 'metadata/subject_splits.parquet']
+
+```
+
+`by_file` pinpoints *which* file moved, and is dropped above 64 files so a thousand-shard dataset
+does not produce a thousand-line block.
+
+> [!IMPORTANT]
+> This is a digest of **bytes**, which makes it the strictest identity check available and also
+> means it is sensitive to re-encoding. The same rows rewritten by a different parquet writer, or
+> with different compression or row-group sizes, produce a different digest. That is why the default
+> policy treats a digest change as a **warning** rather than an error.
+>
+> The false positive is self-diagnosing: when only the encoding changed, the digest moves and every
+> single statistic stays put. When the data changed, both move. Once you have confirmed your ETL is
+> byte-reproducible, promote it in your policy:
+>
+> ```yaml
+> rules:
+>   - {path: dataset_digest.combined, kind: exact, on_change: error}
+> ```
+
+Set `dataset_digest: none` (or `--dataset-digest none`) to skip it, which also skips the extra pass
+over the raw bytes.
 
 ## `layout` — schema and physical structure
 

@@ -123,6 +123,7 @@
   },
   "config": {
     "code_metadata_only_digests": true,
+    "dataset_digest": "files",
     "digest_subject_thresholds": [
       20,
       100,
@@ -175,6 +176,26 @@
     "etl_version": "0.3.1",
     "meds_version": "0.4.1",
     "present": true
+  },
+  "dataset_digest": {
+    "by_file": {
+      "data/held_out/0.parquet": "sha256:45eff0bb9943b7cc5ace032d8d5d80a6fbbbd1ede6dbb62fea6454bb0aeb5ff4",
+      "data/train/0.parquet": "sha256:429a2187b8fa26f5f73aa2b16333a2d424c1caea7e4ee00fb7f75309a71fb507",
+      "data/tuning/0.parquet": "sha256:00f1b0709fef14a8b9df4734fabf4291793e7d53eec9b0a312f5c8cb65b42624",
+      "metadata/codes.parquet": "sha256:1a96cc0efd92976697906e87eb03d4789db553ecf10db7b147e1bf65ef92fd64",
+      "metadata/dataset.json": "sha256:1ad6382d4203303a0899b83722dbbbc44a0b7e305d49afc802e4936490241b18",
+      "metadata/subject_splits.parquet": "sha256:679e83c99a3fbdc0a8005e9c2f9af0b51ad6d04711894e232e82abd832aac1a7"
+    },
+    "code_metadata": "sha256:d437f8446e79814ef9b6ab4fa2ba82b75efc44403d0347a7e2b2921836ee89c2",
+    "combined": "sha256:e33b19f7c5911b30d287b411688f4997192d15d7e62beafa6d371854a63fee93",
+    "data": {
+      "digest": "sha256:0bfe3189f793f31eae56a741e6b3e7a2d1315f29edb2d9a7ae17389b7d5fdb04",
+      "n_files": 3
+    },
+    "dataset_metadata": "sha256:7111a866cd5e2c48dd93c157140bdad98a197b19cb097a5a63a38b82e6d8acf8",
+    "method": "files",
+    "n_files": 6,
+    "subject_splits": "sha256:7426a272679f3ec57c20ee7f8bd34df53544476d4ea2acd615e01c3f64e6fa9d"
   },
   "extracted_at": "2026-01-01T00:00:00",
   "layout": {

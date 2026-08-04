@@ -347,6 +347,12 @@ def _dataset_version_finding(
         >>> policy = ComparePolicy.from_dict({"on_dataset_version_change": "relax"})
         >>> _dataset_version_finding(base, curr, policy).severity
         <Severity.INFO: 'info'>
+
+        Under ``ignore`` the change is not reported at all:
+
+        >>> ignoring = ComparePolicy.from_dict({"on_dataset_version_change": "ignore"})
+        >>> _dataset_version_finding(base, curr, ignoring) is None
+        True
     """
     before = (baseline.get("dataset") or {}).get("dataset_version")
     after = (current.get("dataset") or {}).get("dataset_version")
@@ -502,7 +508,8 @@ def compare_summary_stats(
 
         A path that disappears is an error; one that appears is a warning. The asymmetry is
         deliberate: a new field is usually a tool upgrade, while a vanished one means a statistic
-        stopped being computed and is silently no longer checked.
+        stopped being computed and is silently no longer checked. A rule may override either, for
+        the paths where key churn is routine rather than alarming.
 
         >>> pruned = deepcopy(base); del pruned["counts"]["n_measurements"]
         >>> report = compare_summary_stats(base, pruned)
@@ -588,7 +595,7 @@ def compare_summary_stats(
         if in_base and not in_curr:
             finding = Finding(
                 path=path,
-                severity=policy.on_removed_key,
+                severity=rule.on_removed or policy.on_removed_key,
                 kind="removed",
                 baseline=base_flat[path],
                 message="present in baseline but absent from current",
@@ -596,7 +603,7 @@ def compare_summary_stats(
         elif in_curr and not in_base:
             finding = Finding(
                 path=path,
-                severity=policy.on_added_key,
+                severity=rule.on_added or policy.on_added_key,
                 kind="added",
                 current=curr_flat[path],
                 message="present in current but absent from baseline",

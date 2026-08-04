@@ -111,6 +111,16 @@ rules:
     error: 0.05
 
   # ------------------------------------------------------------------------------------------
+  # The dataset checksum. It ships as a warning because it hashes bytes, so re-encoding the same
+  # rows with a different parquet writer moves it. Once you have confirmed your ETL is
+  # byte-reproducible, promote it -- this is then the tightest check in the file, and the one that
+  # says "at dataset_version 3.1 you should get exactly this".
+  # ------------------------------------------------------------------------------------------
+  - path: dataset_digest.combined
+    kind: exact
+    on_change: error
+
+  # ------------------------------------------------------------------------------------------
   # Provenance that legitimately changes on every run. (These four are already ignored by
   # default; listed here as a template for adding your own.)
   # ------------------------------------------------------------------------------------------

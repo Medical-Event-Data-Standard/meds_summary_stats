@@ -64,6 +64,13 @@ Three invariants hold everywhere in `extract.py`, and each is covered by a hypot
 Parent codes from `metadata/codes.parquet` are the one exception: they name published external
 terminologies, so vocabulary names are safe to emit. Their *statistics* are still suppressed.
 
+### Path escaping
+
+`flatten.escape` turns `.` into `\.` inside a key, and `flatten.split_path` is the *only* correct
+way to split a path back into segments -- a plain `path.split(".")` undoes the escaping. Every key
+under `dataset_digest.by_file` is a filename ending in `.parquet`, so this is load-bearing, not
+theoretical.
+
 ### Changing the emitted document
 
 Any change to the meaning of an existing field, or to a digest encoding, is a breaking change:

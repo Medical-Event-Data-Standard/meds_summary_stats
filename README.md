@@ -124,13 +124,32 @@ Splits survive the default suppression floor of 20 subjects, so they are reporte
 
 ```
 
+Alongside the statistics, the fingerprint carries a checksum of the dataset itself — a sha256 over
+the bytes of every file the MEDS schema defines. That answers the prior question, "is this even the
+same dataset?", without reference to any statistic:
+
+```python
+>>> baseline["dataset_digest"]["combined"]
+'sha256:...'
+>>> baseline["dataset_digest"]["n_files"], baseline["dataset_digest"]["data"]["n_files"]
+(6, 3)
+
+```
+
+Files outside the schema are ignored, so task labels and caches in the dataset root cannot affect
+it, and `metadata/dataset.json` is digested separately because its `created_at` changes on every
+run. It is a digest of bytes, so it is also sensitive to re-encoding — see
+[`docs/stats-surface.md`](docs/stats-surface.md#dataset_digest--is-this-the-same-dataset-at-all)
+for what it is and is not invariant to, and for how to promote it from a warning to a hard error
+once you know your ETL is byte-reproducible.
+
 Re-extracting the same dataset reproduces it exactly, which is the property the whole tool rests on:
 
 ```python
 >>> from meds_summary_stats.compare import compare_summary_stats
 >>> from meds_summary_stats.report import render_text
 >>> print(render_text(compare_summary_stats(baseline, baseline)))
-PASS - 186 paths checked, 3 ignored, no findings.
+PASS - 199 paths checked, 4 ignored, no findings.
 
 ```
 
@@ -150,7 +169,7 @@ compare_MEDS_summary_stats examples/stats/v1_baseline.json current.json # exit 1
 >>> regressed = read_summary_stats(EXAMPLES / "stats" / "v1_etl_regression.json")
 >>> report = compare_summary_stats(baseline, regressed)
 >>> report.status, report.failed, report.counts
-('fail', True, {'error': 44, 'info': 0, 'warning': 12})
+('fail', True, {'error': 44, 'info': 0, 'warning': 22})
 
 ```
 
@@ -211,15 +230,19 @@ compare_MEDS_summary_stats examples/stats/v1_baseline.json current.json \
 >>> policy = ComparePolicy.from_dict({"on_dataset_version_change": "relax"})
 >>> relaxed = compare_summary_stats(baseline, refreshed, policy)
 >>> relaxed.status, relaxed.failed, relaxed.counts
-('warn', False, {'error': 0, 'info': 60, 'warning': 3})
+('warn', False, {'error': 0, 'info': 60, 'warning': 11})
 
 ```
 
-The 60 volume findings drop to informational. What survives as a warning is only the *ordering* of
-the vocabulary by frequency, which genuinely did shift as the cohort grew:
+The 60 volume findings drop to informational. What survives as a warning is the *ordering* of the
+vocabulary by frequency, which genuinely did shift as the cohort grew, plus the file checksums,
+which are of course different files:
 
 ```python
->>> sorted(f.path for f in relaxed.findings if str(f.severity) == "warning")
+>>> sorted({f.path.split(".")[0] for f in relaxed.findings if str(f.severity) == "warning"})
+['codes', 'dataset_digest']
+>>> sorted(f.path for f in relaxed.findings
+...        if str(f.severity) == "warning" and f.path.startswith("codes."))
 ['codes.digests.by_measurement_frequency', 'codes.digests.by_subject_frequency',
  'codes.digests.numeric_moments.digest']
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -154,3 +155,68 @@ def format_moment(value: float | None, sig_digits: int) -> str:
         return "0.0"
     exponent = math.floor(math.log10(abs(value)))
     return repr(round(value, sig_digits - 1 - exponent))
+
+
+def file_digest(path: Path, chunk_size: int = 1 << 20) -> str:
+    """Return the sha256 of a file's bytes, read in chunks.
+
+    Args:
+        path: The file to hash.
+        chunk_size: Read size. The default keeps memory flat on multi-gigabyte shards.
+
+    Returns:
+        A ``"sha256:<hex>"`` string.
+
+    Examples:
+        >>> with yaml_disk({"a.txt": "hello", "b.txt": "hello", "c.txt": "world"}) as root:
+        ...     a, b, c = (file_digest(root / f"{n}.txt") for n in "abc")
+        >>> a == b, a == c
+        (True, False)
+        >>> a
+        'sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824'
+
+        Chunking cannot change the result:
+
+        >>> with yaml_disk({"a.txt": "x" * 5000}) as root:
+        ...     file_digest(root / "a.txt", chunk_size=7) == file_digest(root / "a.txt")
+        True
+    """
+    h = hashlib.sha256()
+    with Path(path).open("rb") as f:
+        while chunk := f.read(chunk_size):
+            h.update(chunk)
+    return f"{DIGEST_PREFIX}{h.hexdigest()}"
+
+
+def combine_digests(digests: Iterable[str]) -> str:
+    """Combine several digests into one, independently of the order they arrive in.
+
+    Sorting before hashing is what makes this order-independent, and it keeps the result an ordinary
+    sha256 of a canonical string rather than some bespoke arithmetic combination. Duplicates are
+    retained, so two shards with identical contents are not silently collapsed into one.
+
+    Args:
+        digests: The digests to combine.
+
+    Returns:
+        A single ``"sha256:<hex>"`` string.
+
+    Examples:
+        >>> a, b = digest(["a"]), digest(["b"])
+        >>> combine_digests([a, b]) == combine_digests([b, a])
+        True
+        >>> combine_digests([a, b]) == combine_digests([a])
+        False
+
+        Multiplicity matters -- two identical shards are not the same as one:
+
+        >>> combine_digests([a, a]) == combine_digests([a])
+        False
+
+        The empty combination is well defined, so a dataset with no files of a given kind still has
+        a comparable digest:
+
+        >>> combine_digests([])
+        'sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+    """
+    return digest(sorted(digests))
