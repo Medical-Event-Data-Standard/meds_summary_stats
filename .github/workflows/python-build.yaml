@@ -1,6 +1,15 @@
 name: Publish Python 🐍 distribution 📦 to PyPI and TestPyPI
 
-on: push
+# Build on every branch push (so a PR gets build validation), but publish only for release tags.
+#
+# The tag filter is load-bearing, not decoration. The repo also carries a floating `v0` tag for the
+# composite action, and an unfiltered `on: push` matched it: setuptools-scm derived the version `0`
+# from that tag and the publish job uploaded `meds_summary_stats-0` to PyPI. Restricting to
+# digit-dotted tags means only a real release can ever reach the publish job.
+on:
+  push:
+    branches: ["**"]
+    tags: ["[0-9]+.[0-9]+.[0-9]+*"]
 
 permissions:
   contents: read
@@ -27,10 +36,14 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      # No cache here, deliberately. This job's artifacts get published, and a tag-triggered
+      # publish makes a restored cache a supply-chain path: anything able to poison the uv cache
+      # from a branch build would be baked into a release. Caching buys nothing for a single
+      # `uv build` in any case. (zizmor: cache-poisoning)
       - name: Install uv
         uses: astral-sh/setup-uv@v9.0.0
         with:
-          enable-cache: true
+          enable-cache: false
 
       - name: Build
         run: uv build
