@@ -1,6 +1,15 @@
 name: Publish Python 🐍 distribution 📦 to PyPI and TestPyPI
 
-on: push
+# Build on every branch push (so a PR gets build validation), but publish only for release tags.
+#
+# The tag filter is load-bearing, not decoration. The repo also carries a floating `v0` tag for the
+# composite action, and an unfiltered `on: push` matched it: setuptools-scm derived the version `0`
+# from that tag and the publish job uploaded `meds_summary_stats-0` to PyPI. Restricting to
+# digit-dotted tags means only a real release can ever reach the publish job.
+on:
+  push:
+    branches: ["**"]
+    tags: ["[0-9]+.[0-9]+.[0-9]+*"]
 
 permissions:
   contents: read
