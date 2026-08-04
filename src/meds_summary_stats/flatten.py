@@ -1,0 +1,185 @@
+"""Flattening of nested stats documents into ``path -> value`` maps.
+
+Comparison operates on flat paths rather than on the nested document, because the tolerance policy is
+naturally expressed as globs over paths (``codes.digests.thresholded.*.alphabetical``) and because a
+flat map makes "present in one document but not the other" a first-class, checkable condition rather
+than a recursive special case.
+"""
+
+from __future__ import annotations
+
+import fnmatch
+from typing import Any
+
+#: Separator between path segments.
+SEP = "."
+
+#: Replacement for a separator character occurring inside a key.
+#:
+#: Keys in a stats document are namespaces, split names, and calendar years -- none of which normally
+#: contain a dot, but ETL-produced split names are not guaranteed to behave.
+ESCAPED_SEP = "\\."
+
+
+def escape(key: str) -> str:
+    r"""Escape a path segment so it cannot be mistaken for two segments.
+
+    Examples:
+        >>> escape("train"), escape("v1.2")
+        ('train', 'v1\\.2')
+    """
+    return key.replace(SEP, ESCAPED_SEP)
+
+
+def flatten(document: Any, prefix: str = "") -> dict[str, Any]:
+    r"""Flatten a nested document to a map from dotted path to scalar.
+
+    Lists are flattened by index. Empty containers are preserved as leaves, because "this mapping is
+    empty" is itself a fact worth diffing -- an ETL that stops emitting any split at all should not
+    look identical to one that never had the key.
+
+    Args:
+        document: The nested structure to flatten.
+        prefix: Path prefix for recursion.
+
+    Returns:
+        A flat mapping from path to scalar value.
+
+    Examples:
+        >>> from pprint import pprint
+        >>> pprint(flatten({"counts": {"n_subjects": 10, "nested": {"a": 1}}, "ok": True}))
+        {'counts.n_subjects': 10, 'counts.nested.a': 1, 'ok': True}
+
+        Lists index positionally:
+
+        >>> pprint(flatten({"cols": ["a", "b"]}))
+        {'cols.0': 'a', 'cols.1': 'b'}
+
+        Empty containers survive as leaves rather than vanishing:
+
+        >>> pprint(flatten({"by_split": {}, "shards": []}))
+        {'by_split': {}, 'shards': []}
+
+        Nulls are values, not absences -- a field that went from a number to null is a change, not a
+        removal:
+
+        >>> flatten({"a": None})
+        {'a': None}
+
+        Dots inside keys are escaped so that a split literally named ``v1.2`` cannot collide with a
+        nested ``v1`` mapping:
+
+        >>> flatten({"splits": {"v1.2": 5}})
+        {'splits.v1\\.2': 5}
+    """
+    if isinstance(document, dict) and document:
+        out: dict[str, Any] = {}
+        for key, value in document.items():
+            path = f"{prefix}{SEP}{escape(str(key))}" if prefix else escape(str(key))
+            out.update(flatten(value, path))
+        return out
+    if isinstance(document, list) and document:
+        out = {}
+        for i, value in enumerate(document):
+            out.update(flatten(value, f"{prefix}{SEP}{i}" if prefix else str(i)))
+        return out
+    return {prefix: document}
+
+
+def matches(path: str, pattern: str) -> bool:
+    """Whether ``path`` matches a glob ``pattern``.
+
+    ``*`` matches within a single segment only, so ``codes.*`` selects the immediate children of
+    ``codes`` rather than its whole subtree. Use ``**`` to cross segment boundaries. Without that
+    distinction a rule intended for top-level counts would silently capture every nested quantile
+    beneath them.
+
+    Args:
+        path: The dotted path to test.
+        pattern: The glob to test against.
+
+    Returns:
+        True on match.
+
+    Examples:
+        >>> matches("counts.n_subjects", "counts.*")
+        True
+        >>> matches("counts.numeric.mean", "counts.*")
+        False
+        >>> matches("counts.numeric.mean", "counts.**")
+        True
+
+        A trailing ``**`` also matches the node itself, so ``codes.**`` covers ``codes`` and
+        everything under it:
+
+        >>> matches("codes", "codes.**"), matches("codes.digests.alphabetical", "codes.**")
+        (True, True)
+
+        Exact paths match themselves:
+
+        >>> matches("counts.n_subjects", "counts.n_subjects")
+        True
+
+        Wildcards work mid-path, which is how per-key rules are written:
+
+        >>> matches("codes.by_namespace.LAB.n_subjects", "codes.by_namespace.*.n_subjects")
+        True
+        >>> matches("codes.by_namespace.LAB.numeric.mean", "codes.by_namespace.*.n_subjects")
+        False
+    """
+    if pattern.endswith(f"{SEP}**") and path == pattern[: -len(f"{SEP}**")]:
+        return True
+    path_parts = path.split(SEP)
+    pattern_parts = pattern.split(SEP)
+    return _match_parts(path_parts, pattern_parts)
+
+
+def _match_parts(path_parts: list[str], pattern_parts: list[str]) -> bool:
+    """Recursively match segment lists, treating ``**`` as spanning any number of segments.
+
+    Examples:
+        >>> _match_parts(["a", "b", "c"], ["a", "**"])
+        True
+        >>> _match_parts(["a", "b", "c"], ["a", "*"])
+        False
+        >>> _match_parts([], [])
+        True
+        >>> _match_parts(["a"], ["**"])
+        True
+    """
+    if not pattern_parts:
+        return not path_parts
+    head, *rest = pattern_parts
+    if head == "**":
+        if not rest:
+            return True
+        return any(_match_parts(path_parts[i:], rest) for i in range(len(path_parts) + 1))
+    if not path_parts:
+        return False
+    return fnmatch.fnmatchcase(path_parts[0], head) and _match_parts(path_parts[1:], rest)
+
+
+def specificity(pattern: str) -> tuple[int, int, int]:
+    """Rank a pattern's specificity, for resolving which of several matching rules wins.
+
+    Ordering is by number of literal (non-wildcard) segments, then by total segment count, then by
+    pattern length. A more literal pattern always beats a more wildcarded one, so a rule written for
+    ``counts.n_subjects`` is not overridden by a blanket ``counts.*``.
+
+    Args:
+        pattern: The glob to rank.
+
+    Returns:
+        A sort key; larger is more specific.
+
+    Examples:
+        >>> specificity("counts.n_subjects") > specificity("counts.*")
+        True
+        >>> specificity("counts.*") > specificity("**")
+        True
+        >>> specificity("codes.by_namespace.*.n_subjects") > specificity("codes.by_namespace.**")
+        True
+    """
+    parts = pattern.split(SEP)
+    literal = sum(1 for p in parts if "*" not in p)
+    return (literal, len(parts), len(pattern))

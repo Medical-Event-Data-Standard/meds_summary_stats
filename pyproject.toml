@@ -40,8 +40,8 @@ docs = []
 [project.optional-dependencies]
 
 [project.scripts]
-extract_MEDS_summary_stats = "meds_summary_stats.__main__:extract_main"
-compare_MEDS_summary_stats = "meds_summary_stats.__main__:compare_main"
+extract_MEDS_summary_stats = "meds_summary_stats.cli:extract_main"
+compare_MEDS_summary_stats = "meds_summary_stats.cli:compare_main"
 
 [tool.pytest.ini_options] # Default pytest options
 addopts = [
