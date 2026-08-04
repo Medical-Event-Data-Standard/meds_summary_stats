@@ -83,11 +83,22 @@ def _iso(value: datetime.datetime | None) -> str | None:
 def _qkey(q: float) -> str:
     """Render a quantile as its stats-document key.
 
+    Percentile spelling rather than the raw fraction, because a key of ``0.5`` would contain the
+    path separator and force escaping into every policy rule and every report line that mentions a
+    quantile. Fractional percentiles use an underscore for the same reason.
+
     Examples:
-        >>> [_qkey(q) for q in (0.01, 0.5, 0.95)]
-        ['0.01', '0.5', '0.95']
+        >>> [_qkey(q) for q in (0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99)]
+        ['p1', 'p5', 'p25', 'p50', 'p75', 'p95', 'p99']
+        >>> [_qkey(q) for q in (0.001, 0.999, 0.125)]
+        ['p0_1', 'p99_9', 'p12_5']
+
+        No key contains a path separator, at any precision:
+
+        >>> any("." in _qkey(q) for q in (0.001, 0.0125, 0.5, 0.9999))
+        False
     """
-    return f"{q:g}"
+    return f"p{q * 100:g}".replace(".", "_")
 
 
 def _distribution(series: pl.Series, cfg: ExtractConfig) -> dict[str, Any]:
@@ -106,7 +117,7 @@ def _distribution(series: pl.Series, cfg: ExtractConfig) -> dict[str, Any]:
     Examples:
         >>> cfg = ExtractConfig(min_numeric_cell_size=3, quantiles=(0.5,))
         >>> _distribution(pl.Series([1.0, 2.0, 3.0, None]), cfg)
-        {'n': 3, 'mean': 2.0, 'std': 1.0, 'quantiles': {'0.5': 2.0}}
+        {'n': 3, 'mean': 2.0, 'std': 1.0, 'quantiles': {'p50': 2.0}}
 
         Below the floor, the summary collapses to a bare count plus an explicit marker, so a reader
         can tell "suppressed" from "absent":
@@ -1170,7 +1181,7 @@ def _per_subject_block(per_subject: pl.DataFrame, cfg: ExtractConfig) -> dict[st
         >>> sorted(block)
         ['n_events', 'n_measurements', 'n_unique_codes', 'span_days']
         >>> block["n_measurements"]
-        {'n': 2, 'mean': 15.0, 'std': 7.07107, 'quantiles': {'0.5': 15.0}}
+        {'n': 2, 'mean': 15.0, 'std': 7.07107, 'quantiles': {'p50': 15.0}}
         >>> block["span_days"]["mean"]
         6.0
     """
@@ -1209,9 +1220,9 @@ def _time_block(
 
         With ``numeric_detail="quantiles"``, full-column time quantiles are added as ISO strings:
 
-        >>> tq = pl.DataFrame([{"q0.5": 1577836800000000}])
+        >>> tq = pl.DataFrame([{"qp50": 1577836800000000}])
         >>> _time_block(by_year, tq, ExtractConfig(quantiles=(0.5,)))["quantiles"]
-        {'0.5': '2020-01-01T00:00:00'}
+        {'p50': '2020-01-01T00:00:00'}
     """
     rows = [
         {"year": str(r["year"]), "n_measurements": r["n_measurements"], "n_subjects": r["n_subjects"]}

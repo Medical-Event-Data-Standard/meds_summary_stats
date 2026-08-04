@@ -1,9 +1,9 @@
 """Extraction configuration and the privacy guarantees it encodes.
 
-Every knob that can affect the emitted numbers lives here, and the resolved config is written into the
-stats file itself. Comparison then refuses to trust a diff between two files extracted under different
-configs, because (for example) digests taken at different subject thresholds are simply different
-quantities and their inequality means nothing.
+Every knob that can affect the emitted numbers lives here, and the resolved config is written into the stats
+file itself. Comparison then refuses to trust a diff between two files extracted under different configs,
+because (for example) digests taken at different subject thresholds are simply different quantities and their
+inequality means nothing.
 """
 
 from __future__ import annotations

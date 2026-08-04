@@ -19,7 +19,7 @@ from pathlib import Path
 
 import yaml
 
-from .compare import compare_summary_stats
+from .compare import ComparisonReport, compare_summary_stats
 from .config import ExtractConfig
 from .extract import (
     NotAMEDSDatasetError,
@@ -333,8 +333,61 @@ def compare_main(argv: list[str] | None = None) -> int:
     if summary_path := os.environ.get("GITHUB_STEP_SUMMARY"):
         with Path(summary_path).open("a") as f:
             f.write(markdown)
+    _write_github_outputs(report)
 
     return EXIT_REGRESSION if report.failed else 0
+
+
+def _write_github_outputs(report: ComparisonReport) -> None:
+    """Publish the verdict as GitHub Actions step outputs, when running inside one.
+
+    Doing this here rather than in the composite action keeps the action's shell free of JSON
+    parsing -- no ``jq`` dependency, no inline Python indented into a YAML block scalar, and no
+    second place that has to know the report's field names.
+
+    Args:
+        report: The report to publish.
+
+    Examples:
+        Outside Actions, ``GITHUB_OUTPUT`` is unset and this does nothing:
+
+        >>> import os
+        >>> report = ComparisonReport(status="warn", failed=False, fail_on="error", findings=(),
+        ...                           n_paths_checked=9, n_paths_ignored=1,
+        ...                           dataset_version_changed=True, relaxed=False)
+        >>> _write_github_outputs(report) is None
+        True
+
+        Inside one, it appends the fields the action keys on:
+
+        >>> with tempfile.TemporaryDirectory() as tmp:
+        ...     out = Path(tmp) / "out.txt"
+        ...     os.environ["GITHUB_OUTPUT"] = str(out)
+        ...     _write_github_outputs(report)
+        ...     del os.environ["GITHUB_OUTPUT"]
+        ...     print(out.read_text(), end="")
+        status=warn
+        failed=false
+        n_errors=0
+        n_warnings=0
+        dataset_version_changed=true
+        relaxed=false
+    """
+    output_path = os.environ.get("GITHUB_OUTPUT")
+    if not output_path:
+        return
+    counts = report.counts
+    fields = {
+        "status": report.status,
+        "failed": str(report.failed).lower(),
+        "n_errors": counts["error"],
+        "n_warnings": counts["warning"],
+        "dataset_version_changed": str(report.dataset_version_changed).lower(),
+        "relaxed": str(report.relaxed).lower(),
+    }
+    with Path(output_path).open("a") as f:
+        for key, value in fields.items():
+            f.write(f"{key}={value}\n")
 
 
 def main(argv: list[str] | None = None) -> int:

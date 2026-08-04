@@ -1,0 +1,112 @@
+# Example comparison policy.
+#
+# Everything here is optional. The built-in defaults are already a sensible ETL-regression policy;
+# a file like this only states what you want to differ. Pass it with
+# `compare_MEDS_summary_stats ... --config examples/policy.yaml`, or as the `policy:` input to the
+# GitHub Action.
+#
+# Rules are matched by *specificity*, not by order: the rule with the most literal (non-wildcard)
+# path segments wins, and among equally specific rules the later one wins. Since your rules are
+# appended to the defaults, writing a rule with the same path as a default overrides it.
+#
+#   `*`  matches exactly one path segment
+#   `**` matches any number of segments
+#
+# Run `compare_MEDS_summary_stats a.json b.json -o report.json` and read `report.json` to see the
+# exact paths available; every leaf of the stats document is one.
+
+# ---------------------------------------------------------------------------------------------
+# What happens when the two files describe different dataset versions.
+#
+#   ignore  say nothing
+#   warn    note it, change nothing else (default)
+#   error   a version change is itself a failure
+#   relax   downgrade everything except schema and vocabulary identity to informational
+#
+# `relax` is the right setting for a pipeline that re-extracts whenever the source data is
+# refreshed: volume drift is then expected, but an ETL bug is still an ETL bug.
+on_dataset_version_change: warn
+
+# A statistic that stopped being computed is silently no longer checked, so its disappearance is an
+# error. A new one is usually just a tool upgrade.
+on_removed_key: error
+on_added_key: warning
+
+# error (default) | warning | never.
+# `never` reports everything and always exits 0 -- the right first step when adding this check to a
+# repo that has never had it, so you can see the noise before enforcing on it.
+fail_on: error
+
+rules:
+  # ------------------------------------------------------------------------------------------
+  # Volume. Tighten these once you know how stable your ETL actually is.
+  # ------------------------------------------------------------------------------------------
+  - path: counts.n_subjects
+    kind: relative
+    warn: 0.0 # any movement at all is worth seeing
+    error: 0.002 # 0.2%
+
+  - path: counts.n_measurements
+    kind: relative
+    warn: 0.001
+    error: 0.01
+
+  # ------------------------------------------------------------------------------------------
+  # Data quality invariants that should simply never move off zero.
+  # ------------------------------------------------------------------------------------------
+  - path: counts.quality.**
+    kind: absolute
+    error: 0
+
+  - path: code_metadata.n_data_codes_missing_from_metadata
+    kind: absolute
+    error: 0
+
+  # ------------------------------------------------------------------------------------------
+  # Vocabulary. The alphabetical digest changes if and only if the code *set* changed; the
+  # frequency-ordered digests also change when relative ranks shuffle, which happens on any small
+  # count change -- keep those as warnings unless your ETL is very stable.
+  # ------------------------------------------------------------------------------------------
+  - path: codes.digests.alphabetical
+    kind: exact
+    on_change: error
+
+  - path: codes.digests.by_measurement_frequency
+    kind: exact
+    on_change: warning
+
+  # The thresholded digests cover only codes above a subject floor, so they are far less noisy
+  # than the full-vocabulary ones. Treating the 1000-subject one as hard is usually safe.
+  - path: codes.digests.thresholded.1000.alphabetical
+    kind: exact
+    on_change: error
+
+  # ------------------------------------------------------------------------------------------
+  # Distributions. Loosen for genuinely noisy quantities; tighten where a shift means a unit
+  # conversion or a clamping bug.
+  # ------------------------------------------------------------------------------------------
+  - path: codes.by_namespace.*.numeric.mean
+    kind: relative
+    warn: 0.002
+    error: 0.01
+
+  - path: per_subject.**.quantiles.*
+    kind: relative
+    warn: 0.01
+    error: 0.05
+
+  # Calendar-year volume moves when the source data is refreshed but should be flat otherwise.
+  - path: time.by_year.*.n_measurements
+    kind: relative
+    warn: 0.005
+    error: 0.05
+
+  # ------------------------------------------------------------------------------------------
+  # Provenance that legitimately changes on every run. (These four are already ignored by
+  # default; listed here as a template for adding your own.)
+  # ------------------------------------------------------------------------------------------
+  - path: dataset.etl_version
+    kind: ignore
+
+  - path: dataset.location_uri
+    kind: ignore

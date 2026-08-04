@@ -1,0 +1,192 @@
+name: MEDS summary-stats regression check
+description: >-
+  Extract privacy-safe summary statistics from a MEDS dataset and, given a baseline, fail the job if
+  the ETL has regressed.
+author: Medical Event Data Standard
+branding:
+  icon: activity
+  color: blue
+
+inputs:
+  meds-dir:
+    description: Root of the MEDS dataset to summarize (the directory containing data/ and metadata/).
+    required: true
+  baseline:
+    description: >-
+      Path to the baseline stats JSON to compare against. Leave empty to extract only, which is how
+      you produce the first baseline.
+    required: false
+    default: ""
+  output:
+    description: Where to write the extracted stats JSON.
+    required: false
+    default: meds-summary-stats.json
+  report:
+    description: Where to write the machine-readable comparison report.
+    required: false
+    default: meds-summary-stats-report.json
+  markdown:
+    description: Where to write the markdown comparison report. Also appended to the job summary.
+    required: false
+    default: meds-summary-stats-report.md
+  extract-config:
+    description: Path to a YAML extraction config. Overridden by the individual inputs below.
+    required: false
+    default: ""
+  policy:
+    description: Path to a YAML comparison policy. Overridden by the individual inputs below.
+    required: false
+    default: ""
+  min-cell-size:
+    description: Minimum distinct subjects for a keyed cell to be reported. Leave empty for the default (20).
+    required: false
+    default: ""
+  numeric-detail:
+    description: "'moments' (default) or 'quantiles'. The latter is markedly more expensive."
+    required: false
+    default: ""
+  fail-on:
+    description: "Minimum severity that fails the job: error (default), warning, or never."
+    required: false
+    default: error
+  on-dataset-version-change:
+    description: >-
+      What to do when the baseline and current documents describe different dataset versions:
+      ignore, warn (default), error, or relax. 'relax' downgrades volume drift to informational
+      while keeping schema and vocabulary checks hard -- use it when the data itself is expected to
+      have changed.
+    required: false
+    default: ""
+  package-spec:
+    description: >-
+      What to install. Defaults to the latest release from PyPI. Pin it for reproducible CI, e.g.
+      'meds_summary_stats==0.1.0', or point at a git ref or local path.
+    required: false
+    default: meds_summary_stats
+  python-version:
+    description: Python version used to run the tool.
+    required: false
+    default: "3.12"
+  upload-artifacts:
+    description: Whether to upload the stats and report files as a workflow artifact.
+    required: false
+    default: "true"
+  artifact-name:
+    description: Name of the uploaded artifact.
+    required: false
+    default: meds-summary-stats
+
+outputs:
+  stats-path:
+    description: Path to the extracted stats JSON.
+    value: ${{ steps.extract.outputs.stats-path }}
+  report-path:
+    description: Path to the comparison report JSON, empty when no baseline was given.
+    value: ${{ steps.compare.outputs.report-path }}
+  status:
+    description: "pass, warn, or fail. Empty when no baseline was given."
+    value: ${{ steps.compare.outputs.status }}
+  failed:
+    description: "'true' if the comparison breached the fail-on threshold. Empty when no baseline was given."
+    value: ${{ steps.compare.outputs.failed }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v6.2.0
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v8.1.0
+      with:
+        enable-cache: true
+        cache-suffix: meds-summary-stats
+
+    # Every input reaches the shell through `env:` rather than `${{ }}` interpolation, so a value
+    # containing shell metacharacters is data, not code. zizmor enforces this.
+    - name: Extract summary statistics
+      id: extract
+      shell: bash
+      env:
+        MEDS_DIR: ${{ inputs.meds-dir }}
+        OUTPUT: ${{ inputs.output }}
+        EXTRACT_CONFIG: ${{ inputs.extract-config }}
+        MIN_CELL_SIZE: ${{ inputs.min-cell-size }}
+        NUMERIC_DETAIL: ${{ inputs.numeric-detail }}
+        PACKAGE_SPEC: ${{ inputs.package-spec }}
+      run: |
+        set -euo pipefail
+
+        args=("$MEDS_DIR" --output "$OUTPUT")
+        if [[ -n "$EXTRACT_CONFIG" ]]; then args+=(--config "$EXTRACT_CONFIG"); fi
+        if [[ -n "$MIN_CELL_SIZE" ]]; then args+=(--min-cell-size "$MIN_CELL_SIZE"); fi
+        if [[ -n "$NUMERIC_DETAIL" ]]; then args+=(--numeric-detail "$NUMERIC_DETAIL"); fi
+
+        uvx --from "$PACKAGE_SPEC" extract_MEDS_summary_stats "${args[@]}"
+        echo "stats-path=$OUTPUT" >>"$GITHUB_OUTPUT"
+
+    - name: Compare against baseline
+      id: compare
+      if: inputs.baseline != ''
+      shell: bash
+      env:
+        BASELINE: ${{ inputs.baseline }}
+        OUTPUT: ${{ inputs.output }}
+        REPORT: ${{ inputs.report }}
+        MARKDOWN: ${{ inputs.markdown }}
+        POLICY: ${{ inputs.policy }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        ON_VERSION_CHANGE: ${{ inputs.on-dataset-version-change }}
+        PACKAGE_SPEC: ${{ inputs.package-spec }}
+      run: |
+        set -uo pipefail
+
+        if [[ ! -f "$BASELINE" ]]; then
+          echo "::error::Baseline file not found: $BASELINE"
+          exit 1
+        fi
+
+        args=("$BASELINE" "$OUTPUT" --output "$REPORT" --markdown "$MARKDOWN" --fail-on "$FAIL_ON")
+        if [[ -n "$POLICY" ]]; then args+=(--config "$POLICY"); fi
+        if [[ -n "$ON_VERSION_CHANGE" ]]; then
+          args+=(--on-dataset-version-change "$ON_VERSION_CHANGE")
+        fi
+
+        # compare_MEDS_summary_stats writes its markdown to $GITHUB_STEP_SUMMARY and its verdict
+        # (status, failed, n_errors, ...) to $GITHUB_OUTPUT itself, so nothing here needs to parse
+        # JSON. `set -e` is deliberately off: exit code 1 means "regression found", which must not
+        # abort the step before artifacts upload. Anything above 1 is a genuine tool failure.
+        uvx --from "$PACKAGE_SPEC" compare_MEDS_summary_stats "${args[@]}"
+        code=$?
+        if (( code > 1 )); then
+          echo "::error::compare_MEDS_summary_stats exited with code $code"
+          exit "$code"
+        fi
+
+        echo "report-path=$REPORT" >>"$GITHUB_OUTPUT"
+
+    - name: Upload artifacts
+      if: ${{ always() && inputs.upload-artifacts == 'true' }}
+      uses: actions/upload-artifact@v7.0.1
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: |
+          ${{ inputs.output }}
+          ${{ inputs.report }}
+          ${{ inputs.markdown }}
+        if-no-files-found: warn
+        retention-days: 90
+
+    - name: Fail on regression
+      if: ${{ steps.compare.outputs.failed == 'true' }}
+      shell: bash
+      env:
+        STATUS: ${{ steps.compare.outputs.status }}
+        N_ERRORS: ${{ steps.compare.outputs.n_errors }}
+        N_WARNINGS: ${{ steps.compare.outputs.n_warnings }}
+      run: |
+        echo "::error::MEDS summary-stats comparison reported '${STATUS}'" \
+             "(${N_ERRORS} errors, ${N_WARNINGS} warnings). See the job summary for details."
+        exit 1

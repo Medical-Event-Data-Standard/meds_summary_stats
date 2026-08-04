@@ -127,8 +127,7 @@ class TestPrivacyInvariants:
         """No code string may appear in the emitted document, at any suppression threshold.
 
         Run with the floor at 1 -- suppression effectively disabled -- because the guarantee must be
-        structural. If it only held because the floor happened to be high, it would not be a
-        guarantee at all.
+        structural. If it only held because the floor happened to be high, it would not be a guarantee at all.
         """
         rows, code_rows, n_shards = dataset
         root = _write(tmp_path_factory.mktemp("meds"), rows, code_rows, n_shards)
@@ -162,7 +161,10 @@ class TestPrivacyInvariants:
     @settings(max_examples=15, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
     @given(dataset=meds_datasets())
     def test_a_document_always_compares_equal_to_itself(self, dataset, tmp_path_factory):
-        """Self-comparison must pass for every dataset. A false positive here is a false alarm in CI."""
+        """Self-comparison must pass for every dataset.
+
+        A false positive here is a false alarm in CI.
+        """
         rows, code_rows, n_shards = dataset
         root = _write(tmp_path_factory.mktemp("meds"), rows, code_rows, n_shards)
         stats = extract_summary_stats(root)
@@ -292,7 +294,10 @@ class TestPathAlgebra:
         assert set(flat.values()) == set(document.values())
 
     def test_flattening_an_empty_document_yields_one_empty_leaf(self):
-        """An empty document is itself the leaf. Documented here because it reads as a surprise."""
+        """An empty document is itself the leaf.
+
+        Documented here because it reads as a surprise.
+        """
         assert flatten({}) == {"": {}}
 
     @given(

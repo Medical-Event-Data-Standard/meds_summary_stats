@@ -65,8 +65,8 @@ def test_round_trip_is_stable(generated_sample_MEDS: Path, tmp_path: Path):
 def test_shard_layout_does_not_change_the_statistics(generated_sample_MEDS: Path, tmp_path: Path):
     """Re-sharding a dataset must not move any statistic except the layout block.
 
-    An ETL that changes its parallelism changes its shard count. That is not a data regression, and
-    conflating the two would make the check useless on any pipeline whose worker count varies.
+    An ETL that changes its parallelism changes its shard count. That is not a data regression, and conflating
+    the two would make the check useless on any pipeline whose worker count varies.
     """
     baseline = extract_summary_stats(generated_sample_MEDS)
 
@@ -176,8 +176,8 @@ def test_relax_distinguishes_data_change_from_etl_regression(dataset_copy: Path,
 def test_suppression_holds_over_a_realistic_dataset(generated_sample_MEDS: Path):
     """No reported cell may be backed by fewer subjects than the configured floor.
 
-    Checked at a floor high enough to bite (the sample dataset has a few hundred subjects), so the
-    assertion exercises the suppression path rather than trivially passing.
+    Checked at a floor high enough to bite (the sample dataset has a few hundred subjects), so the assertion
+    exercises the suppression path rather than trivially passing.
     """
     cfg = ExtractConfig(min_cell_size=100)
     stats = extract_summary_stats(generated_sample_MEDS, cfg)
@@ -202,8 +202,8 @@ def test_suppression_holds_over_a_realistic_dataset(generated_sample_MEDS: Path)
 def test_no_code_string_appears_in_the_output(dataset_name, request):
     """No code string may appear in the output, at any suppression threshold.
 
-    Checked with suppression effectively disabled as well as at the default, because the guarantee
-    is structural -- it must not depend on the floor happening to be high enough.
+    Checked with suppression effectively disabled as well as at the default, because the guarantee is
+    structural -- it must not depend on the floor happening to be high enough.
     """
     meds_dir = request.getfixturevalue(dataset_name)
     codes = set(pl.read_parquet(sorted((meds_dir / "data").rglob("*.parquet")))["code"].unique().to_list())
