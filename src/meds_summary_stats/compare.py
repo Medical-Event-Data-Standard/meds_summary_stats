@@ -607,9 +607,10 @@ def compare_summary_stats(
 
         if finding is None:
             continue
-        if relaxed and finding.kind != "exact":
-            # A data change legitimately moves cells across the suppression floor, so keys appearing
-            # and disappearing is expected here too -- only schema and vocabulary identity stay hard.
+        if relaxed and rule.is_relaxable:
+            # A data change legitimately moves volume, and moves cells across the suppression floor,
+            # so keys appearing and disappearing is expected here too. What stays hard is whatever
+            # the policy marks as not relaxable: schema, dtypes, and vocabulary set identity.
             finding = dataclasses.replace(finding, severity=Severity.INFO)
         findings.append(finding)
 

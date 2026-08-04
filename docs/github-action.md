@@ -29,6 +29,11 @@ git add baselines/mimic-iv-3.1.json && git commit -m "Add MEDS summary-stats bas
 
 Or in CI, by running the action with no `baseline:` input and downloading the artifact.
 
+To see what a baseline looks like before committing one of your own, three are checked in under
+[`examples/stats/`](../examples/stats), extracted from the datasets in
+[`examples/datasets/`](../examples/datasets). The [README walkthrough](../README.md#a-worked-example)
+runs the whole flow against them.
+
 ## Example: gate an ETL pull request
 
 The common case. The ETL runs on a small fixture or a licensed dataset available to the runner, and

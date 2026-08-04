@@ -90,10 +90,30 @@ class Rule:
         warn: Threshold above which a difference is a warning. ``None`` disables the warning tier.
         error: Threshold above which a difference is an error. ``None`` disables the error tier.
         on_change: Severity for an ``exact`` mismatch.
+        relaxable: Whether a dataset-version change excuses this finding, under
+            ``on_dataset_version_change: relax``. ``None`` means "decide by kind": numeric
+            comparisons are excused, ``exact`` ones are not. Set it explicitly for the cases where
+            that default is wrong -- the thresholded vocabulary digests are ``exact``, but their
+            membership depends on absolute subject counts, so a cohort that simply got larger
+            changes them without the vocabulary having changed at all.
 
     Examples:
         >>> Rule(path="counts.*", kind=Kind.RELATIVE, error=0.01)
         Rule(path='counts.*', kind=<Kind.RELATIVE: 'relative'>, warn=None, error=0.01, ...)
+
+        By default, numeric findings are excused by a data refresh and exact ones are not:
+
+        >>> Rule(path="counts.*", kind=Kind.RELATIVE, error=0.01).is_relaxable
+        True
+        >>> Rule(path="layout.*", kind=Kind.EXACT).is_relaxable
+        False
+
+        An explicit setting wins either way:
+
+        >>> Rule(path="codes.digests.thresholded.*", kind=Kind.EXACT, relaxable=True).is_relaxable
+        True
+        >>> Rule(path="counts.n_subjects", kind=Kind.RELATIVE, error=0.01, relaxable=False).is_relaxable
+        False
 
         A numeric rule with no thresholds could never fire, which is almost always a config typo:
 
@@ -115,6 +135,14 @@ class Rule:
     warn: float | None = None
     error: float | None = None
     on_change: Severity = Severity.ERROR
+    relaxable: bool | None = None
+
+    @property
+    def is_relaxable(self) -> bool:
+        """Whether a dataset-version change excuses findings from this rule."""
+        if self.relaxable is not None:
+            return self.relaxable
+        return self.kind is not Kind.EXACT
 
     def __post_init__(self) -> None:
         """Reject rules that cannot fire or whose tiers are inverted."""
@@ -143,7 +171,7 @@ class Rule:
         """
         if "path" not in raw:
             raise ValueError("Every rule needs a 'path'")
-        if unknown := sorted(set(raw) - {"path", "kind", "warn", "error", "on_change"}):
+        if unknown := sorted(set(raw) - {"path", "kind", "warn", "error", "on_change", "relaxable"}):
             raise ValueError(f"Unknown rule keys for path {raw['path']!r}: {unknown}")
         try:
             kind = Kind(raw.get("kind", "exact"))
@@ -157,6 +185,7 @@ class Rule:
             warn=raw.get("warn"),
             error=raw.get("error"),
             on_change=Severity(raw.get("on_change", "error")),
+            relaxable=raw.get("relaxable"),
         )
 
 
@@ -213,9 +242,23 @@ DEFAULT_RULES: tuple[dict[str, Any], ...] = (
     {"path": "codes.digests.by_measurement_frequency", "kind": "exact", "on_change": "warning"},
     {"path": "codes.digests.by_subject_frequency", "kind": "exact", "on_change": "warning"},
     {"path": "codes.digests.numeric_moments.digest", "kind": "exact", "on_change": "warning"},
-    {"path": "codes.digests.thresholded.*.alphabetical", "kind": "exact"},
-    {"path": "codes.digests.thresholded.*.by_measurement_frequency", "kind": "exact", "on_change": "warning"},
-    {"path": "codes.digests.thresholded.*.by_subject_frequency", "kind": "exact", "on_change": "warning"},
+    # Thresholded digests cover only the codes above a subject floor, so their membership moves
+    # with cohort size. They are hard checks when the data is held fixed, but a genuine data refresh
+    # changes them without the vocabulary having changed -- hence `relaxable`.
+    {"path": "codes.digests.thresholded.*.alphabetical", "kind": "exact", "relaxable": True},
+    {
+        "path": "codes.digests.thresholded.*.by_measurement_frequency",
+        "kind": "exact",
+        "on_change": "warning",
+        "relaxable": True,
+    },
+    {
+        "path": "codes.digests.thresholded.*.by_subject_frequency",
+        "kind": "exact",
+        "on_change": "warning",
+        "relaxable": True,
+    },
+    {"path": "codes.digests.numeric_moments.n_codes", "kind": "relative", "warn": 0.0, "error": 0.05},
     {"path": "code_metadata.vocabulary_digest", "kind": "exact"},
     {"path": "code_metadata.ontology.by_vocabulary.*.keys_digest", "kind": "exact"},
     {"path": "code_metadata.ontology.by_vocabulary.*.recognized", "kind": "exact"},

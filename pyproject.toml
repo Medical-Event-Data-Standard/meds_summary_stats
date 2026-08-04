@@ -92,6 +92,9 @@ select = [
 # methods do not, because a well-named test function is already its own sentence.
 # TC003 would push `Path` into a type-checking block, but tests use it at runtime too.
 "tests/**" = ["D102", "D103", "DTZ001", "TC003"]
+# MEDS `time` is a timezone-naive `timestamp[us]` by schema, so the example datasets must be built
+# from naive datetimes; DTZ001 would have us attach a tzinfo the format does not carry.
+"examples/**" = ["DTZ001"]
 
 [tool.ruff.lint.pep8-naming]
 extend-ignore-names = ["*MEDS*", "*NRT*", "D", "L"] # Allow common abbreviations; "D" is used for distributions/datasets

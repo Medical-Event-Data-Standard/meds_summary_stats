@@ -91,3 +91,21 @@ yourself wanting to hash a raw float, you want `format_moment`.
 - `docs/*.md` is collected by pytest. Examples there are executed, so they cannot drift.
 - `action.yml` is exercised by `.github/workflows/action-selftest.yaml`, not by pytest. Changes to
     the composite action need a look at that workflow.
+
+### The worked example
+
+`examples/` holds three committed MEDS datasets, three committed fingerprints extracted from them,
+and the comparison outcomes the README walks through. All three layers are regenerated and checked
+in `tests/test_examples.py`, so any change to extraction, to the default policy, or to the report
+renderer will fail there before it silently invalidates the README.
+
+When such a failure is legitimate, regenerate rather than hand-editing:
+
+```bash
+uv run python examples/build_datasets.py   # only if the dataset shape itself changed
+uv run python examples/build_stats.py      # after any change to what extraction emits
+uv run pytest README.md docs/              # the doctests hold the prose to the new output
+```
+
+The datasets are committed deliberately, so the README's CLI invocations run on a fresh clone.
+`build_datasets.py` is their readable source of truth; treat the parquet as generated output.

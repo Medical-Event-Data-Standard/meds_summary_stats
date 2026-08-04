@@ -29,6 +29,9 @@ def _setup_doctest_namespace(
     """
     doctest_namespace.update(
         {
+            # Absolute, so README and docs examples resolve regardless of the working directory
+            # pytest was invoked from.
+            "EXAMPLES": Path(__file__).parent / "examples",
             "datetime": datetime,
             "tempfile": tempfile,
             "Path": Path,

@@ -35,15 +35,215 @@ compare_MEDS_summary_stats baseline.json current.json
 Both are also `python -m meds_summary_stats extract` / `... compare`, and both are importable
 (`extract_summary_stats`, `compare_summary_stats`).
 
+## A worked example
+
+Three complete MEDS datasets are committed under [`examples/datasets/`](examples/datasets), so
+everything below runs against a fresh clone with no setup. Every output on this page is executed as
+a doctest, so it is what the tool actually prints.
+
 ```python
->>> from meds_summary_stats.extract import extract_summary_stats
->>> from meds_summary_stats.compare import compare_summary_stats
->>> baseline = extract_summary_stats(simple_static_MEDS)
->>> current = extract_summary_stats(simple_static_MEDS)
->>> compare_summary_stats(baseline, current).status
-'pass'
+>>> print_directory(EXAMPLES / "datasets" / "v1_baseline")
+├── data
+│   ├── held_out
+│   │   └── 0.parquet
+│   ├── train
+│   │   └── 0.parquet
+│   └── tuning
+│       └── 0.parquet
+└── metadata
+    ├── codes.parquet
+    ├── dataset.json
+    └── subject_splits.parquet
 
 ```
+
+160 subjects, 2258 measurements, a ten-code vocabulary — half of it mapped into LOINC, ICD10CM, and
+SNOMED via `parent_codes`, half unmapped. [`examples/build_datasets.py`](examples/build_datasets.py)
+is the readable source of truth for what is in them.
+
+### 1. Extract a baseline
+
+```bash
+extract_MEDS_summary_stats examples/datasets/v1_baseline -o examples/stats/v1_baseline.json
+```
+
+That fingerprint is committed at [`examples/stats/v1_baseline.json`](examples/stats/v1_baseline.json)
+— 8 KB of JSON, safe to keep in version control next to the ETL that produced it. The headline
+block:
+
+```python
+>>> from meds_summary_stats.extract import read_summary_stats
+>>> baseline = read_summary_stats(EXAMPLES / "stats" / "v1_baseline.json")
+>>> print(json.dumps(baseline["counts"], indent=2, sort_keys=True))
+{
+  "n_events": 2258,
+  "n_measurements": 2258,
+  "n_static_measurements": 160,
+  "n_subjects": 160,
+  "n_subjects_with_birth": 160,
+  "n_subjects_with_death": 0,
+  "n_subjects_with_static": 160,
+  "n_unique_codes": 10,
+  "numeric": {
+    "mean": 103.9,
+    "n_finite": 1037,
+    "n_infinite": 0,
+    "n_nan": 0,
+    "n_negative": 0,
+    "n_present": 1037,
+    "n_zero": 0,
+    "std": 26.3615
+  },
+  "quality": {
+    "n_empty_code": 0,
+    "n_null_code": 0,
+    "n_null_subject_id": 0
+  }
+}
+
+```
+
+Splits survive the default suppression floor of 20 subjects, so they are reported by name:
+
+```python
+>>> print(json.dumps(baseline["splits"]["by_split"], indent=2, sort_keys=True))
+{
+  "held_out": {
+    "n_measurements": 315,
+    "n_subjects": 24
+  },
+  "train": {
+    "n_measurements": 1593,
+    "n_subjects": 112
+  },
+  "tuning": {
+    "n_measurements": 350,
+    "n_subjects": 24
+  }
+}
+
+```
+
+Re-extracting the same dataset reproduces it exactly, which is the property the whole tool rests on:
+
+```python
+>>> from meds_summary_stats.compare import compare_summary_stats
+>>> from meds_summary_stats.report import render_text
+>>> print(render_text(compare_summary_stats(baseline, baseline)))
+PASS - 186 paths checked, 3 ignored, no findings.
+
+```
+
+### 2. A broken ETL, same source data
+
+[`examples/datasets/v1_etl_regression`](examples/datasets/v1_etl_regression) is the *same* source
+data — `dataset_version` still `1.0` — put through an ETL carrying three independent bugs: `TEMP` is
+emitted in Celsius instead of Fahrenheit, `LAB//SODIUM` is silently renamed, and every twentieth
+subject is dropped.
+
+```bash
+extract_MEDS_summary_stats examples/datasets/v1_etl_regression -o current.json
+compare_MEDS_summary_stats examples/stats/v1_baseline.json current.json # exit 1
+```
+
+```python
+>>> regressed = read_summary_stats(EXAMPLES / "stats" / "v1_etl_regression.json")
+>>> report = compare_summary_stats(baseline, regressed)
+>>> report.status, report.failed, report.counts
+('fail', True, {'error': 44, 'info': 0, 'warning': 12})
+
+```
+
+All three bugs are caught, each on a path that names the problem:
+
+```python
+>>> findings = {f.path: f for f in report.findings}
+
+>>> print(findings["counts.n_subjects"].message)          # dropped subjects
+160 -> 152 (-5.00%), over relative threshold 0.005
+
+>>> findings["codes.digests.alphabetical"].kind           # renamed code
+'exact'
+
+>>> loinc = findings["code_metadata.ontology.by_vocabulary.LOINC.numeric.mean"]
+>>> loinc.baseline, loinc.current                         # Fahrenheit -> Celsius
+(103.9, 88.1595)
+
+```
+
+Note what the second one does *not* say. The vocabulary change is detected by a digest, so neither
+the old code nor the new one appears anywhere in the report:
+
+```python
+>>> blob = json.dumps(report.to_dict())
+>>> "SODIUM" in blob or "LAB//NA" in blob
+False
+
+```
+
+And note what the third one *does*. The per-code moments digest says only "some code's distribution
+moved"; the per-vocabulary moments narrow it to the LOINC-mapped measurements. That is as specific
+as a report can get without naming a code.
+
+### 3. A genuine data refresh
+
+[`examples/datasets/v2_data_refresh`](examples/datasets/v2_data_refresh) bumps `dataset_version` to
+`2.0` and has 220 subjects instead of 160 — same schema, same vocabulary, more data. Strictly, that
+fails:
+
+```python
+>>> refreshed = read_summary_stats(EXAMPLES / "stats" / "v2_data_refresh.json")
+>>> compare_summary_stats(baseline, refreshed).failed
+True
+
+```
+
+Which is the wrong answer, and why `relax` exists. It tells the comparison that a version bump
+excuses volume drift but nothing else:
+
+```bash
+compare_MEDS_summary_stats examples/stats/v1_baseline.json current.json \
+	--on-dataset-version-change relax # exit 0
+```
+
+```python
+>>> from meds_summary_stats.policy import ComparePolicy
+>>> policy = ComparePolicy.from_dict({"on_dataset_version_change": "relax"})
+>>> relaxed = compare_summary_stats(baseline, refreshed, policy)
+>>> relaxed.status, relaxed.failed, relaxed.counts
+('warn', False, {'error': 0, 'info': 60, 'warning': 3})
+
+```
+
+The 60 volume findings drop to informational. What survives as a warning is only the *ordering* of
+the vocabulary by frequency, which genuinely did shift as the cohort grew:
+
+```python
+>>> sorted(f.path for f in relaxed.findings if str(f.severity) == "warning")
+['codes.digests.by_measurement_frequency', 'codes.digests.by_subject_frequency',
+ 'codes.digests.numeric_moments.digest']
+
+```
+
+Crucially, `relax` does not blind the check. The set of codes is unchanged here, and if the refresh
+*had* also broken the vocabulary or the schema, that would still be a hard error:
+
+```python
+>>> baseline["codes"]["digests"]["alphabetical"] == refreshed["codes"]["digests"]["alphabetical"]
+True
+>>> from copy import deepcopy
+>>> also_broken = deepcopy(refreshed)
+>>> also_broken["layout"]["data_columns"]["subject_id"] = "Int32"
+>>> broken_report = compare_summary_stats(baseline, also_broken, policy)
+>>> broken_report.failed
+True
+>>> [f.path for f in broken_report.findings if str(f.severity) == "error"]
+['layout.data_columns.subject_id']
+
+```
+
+The two failure modes are distinguishable, which is the whole point: a data refresh moves volume, a
+broken ETL moves volume *and* the vocabulary *and* a distribution.
 
 ## What it emits
 
