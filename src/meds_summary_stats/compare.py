@@ -584,34 +584,34 @@ def compare_summary_stats(
             continue
 
         in_base, in_curr = path in base_flat, path in curr_flat
+        finding: Finding | None
         if in_base and not in_curr:
-            findings.append(
-                Finding(
-                    path=path,
-                    severity=policy.on_removed_key,
-                    kind="removed",
-                    baseline=base_flat[path],
-                    message="present in baseline but absent from current",
-                )
+            finding = Finding(
+                path=path,
+                severity=policy.on_removed_key,
+                kind="removed",
+                baseline=base_flat[path],
+                message="present in baseline but absent from current",
             )
-            continue
-        if in_curr and not in_base:
-            findings.append(
-                Finding(
-                    path=path,
-                    severity=policy.on_added_key,
-                    kind="added",
-                    current=curr_flat[path],
-                    message="present in current but absent from baseline",
-                )
+        elif in_curr and not in_base:
+            finding = Finding(
+                path=path,
+                severity=policy.on_added_key,
+                kind="added",
+                current=curr_flat[path],
+                message="present in current but absent from baseline",
             )
-            continue
+        else:
+            n_checked += 1
+            finding = _compare_leaf(path, base_flat[path], curr_flat[path], rule)
 
-        n_checked += 1
-        if (finding := _compare_leaf(path, base_flat[path], curr_flat[path], rule)) is not None:
-            if relaxed and finding.kind != "exact":
-                finding = dataclasses.replace(finding, severity=Severity.INFO)
-            findings.append(finding)
+        if finding is None:
+            continue
+        if relaxed and finding.kind != "exact":
+            # A data change legitimately moves cells across the suppression floor, so keys appearing
+            # and disappearing is expected here too -- only schema and vocabulary identity stay hard.
+            finding = dataclasses.replace(finding, severity=Severity.INFO)
+        findings.append(finding)
 
     findings.sort(key=lambda f: (-f.severity._rank, f.path))
     worst = max((f.severity for f in findings), default=Severity.INFO)

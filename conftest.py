@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import polars as pl
+import pyarrow as pa
 import pytest
 
 from meds_summary_stats.config import SUPPRESSED
@@ -33,6 +34,7 @@ def _setup_doctest_namespace(
             "Path": Path,
             "json": json,
             "pl": pl,
+            "pa": pa,
             "SUPPRESSED": SUPPRESSED,
             "simple_static_MEDS": simple_static_MEDS,
             "simple_static_MEDS_dataset_with_task": simple_static_MEDS_dataset_with_task,

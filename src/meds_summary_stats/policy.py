@@ -171,8 +171,9 @@ class DatasetVersionChangeAction(enum.StrEnum):
         IGNORE: Say nothing.
         WARN: Note it as a warning; leave every other rule untouched.
         ERROR: Treat a version change as a failure in itself.
-        RELAX: Downgrade every numeric finding to ``info``, keeping only ``exact`` rules at full
-            severity.
+        RELAX: Downgrade every finding except ``exact`` mismatches to ``info`` -- including keys
+            that appeared or disappeared, since a data change moves cells across the suppression
+            floor. Schema and vocabulary identity stay at full severity.
     """
 
     IGNORE = "ignore"

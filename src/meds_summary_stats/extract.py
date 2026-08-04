@@ -387,6 +387,7 @@ def _layout(meds_dir: Path, shards: list[Path]) -> dict[str, Any]:
         >>> with yaml_disk(spec) as d:
         ...     pprint(_layout(d, _shard_paths(d)))
         {'code_metadata_columns': None,
+         'column_dtype_conflicts': {},
          'column_presence': {'code': 2, 'numeric_value': 1, 'subject_id': 2},
          'data_columns': {'code': 'String', 'numeric_value': 'Float64', 'subject_id': 'Int64'},
          'extra_data_columns': [],
@@ -397,13 +398,34 @@ def _layout(meds_dir: Path, shards: list[Path]) -> dict[str, Any]:
          'n_data_shards': 2,
          'shard_names': ['0', '1'],
          'shard_names_digest': 'sha256:...'}
+
+        A column typed differently in different shards is reported rather than resolved silently.
+        An ETL that half-migrated a dtype produces exactly this, and it is invisible in any
+        single-shard view:
+
+        >>> spec = {"data": {
+        ...     "0.parquet": {"subject_id": [1], "code": ["A"]},
+        ...     "1.parquet": pa.table({"subject_id": pa.array([2], pa.int32()),
+        ...                            "code": pa.array(["B"])}),
+        ... }}
+        >>> with yaml_disk(spec) as d:
+        ...     layout = _layout(d, _shard_paths(d))
+        >>> layout["column_dtype_conflicts"]
+        {'subject_id': ['Int32', 'Int64']}
+        >>> layout["data_columns"]["subject_id"]
+        'Int64'
     """
     presence: dict[str, int] = {}
+    observed: dict[str, set[str]] = {}
     dtypes: dict[str, str] = {}
     for shard in shards:
         for name, dtype in pl.scan_parquet(shard).collect_schema().items():
             presence[name] = presence.get(name, 0) + 1
+            observed.setdefault(name, set()).add(str(dtype))
+            # `data_columns` reports the first shard (in sorted order) that carries the column, so
+            # the value is deterministic; `column_dtype_conflicts` carries the full truth.
             dtypes.setdefault(name, str(dtype))
+    conflicts = {name: sorted(seen) for name, seen in sorted(observed.items()) if len(seen) > 1}
 
     names = [_shard_name(meds_dir, s) for s in shards]
     code_metadata_fp = meds_dir / meds.code_metadata_filepath
@@ -417,6 +439,7 @@ def _layout(meds_dir: Path, shards: list[Path]) -> dict[str, Any]:
         "shard_names": sorted(names) if len(names) <= 64 else None,
         "shard_names_digest": digest(sorted(names)),
         "data_columns": dict(sorted(dtypes.items())),
+        "column_dtype_conflicts": conflicts,
         "column_presence": dict(sorted(presence.items())),
         "missing_core_columns": [c for c in _CORE_DATA_COLUMNS if c not in dtypes],
         "extra_data_columns": sorted(set(dtypes) - set(_CORE_DATA_COLUMNS)),
@@ -430,9 +453,15 @@ def _layout(meds_dir: Path, shards: list[Path]) -> dict[str, Any]:
 def _base_frame(shards: list[Path], available: set[str]) -> pl.LazyFrame:
     """Build the normalized lazy frame every aggregate reads from.
 
-    Missing optional columns are materialized as typed nulls so that downstream expressions do not
-    need to branch on schema, and ``numeric_value`` is widened to ``Float64`` so that moments do not
-    accumulate ``Float32`` error over billions of rows.
+    Each shard is scanned and normalized independently before being concatenated, rather than opened
+    as one multi-file scan. That costs nothing at plan time and buys the ability to read a dataset
+    whose shards disagree on schema -- a column present in some and not others, or typed ``Int32``
+    here and ``Int64`` there. Such a dataset is broken, and a tool for finding broken ETL output has
+    to be able to open it and say so (see ``layout.column_dtype_conflicts``) rather than crash.
+
+    Missing optional columns are materialized as typed nulls so downstream expressions need not
+    branch on schema, and ``numeric_value`` is widened to ``Float64`` so moments do not accumulate
+    ``Float32`` error over billions of rows.
 
     Args:
         shards: The data shard paths.
@@ -465,25 +494,39 @@ def _base_frame(shards: list[Path], available: set[str]) -> pl.LazyFrame:
             ...
         meds_summary_stats.extract.NotAMEDSDatasetError: Data shards are missing required
         column(s): subject_id
+
+        Shards that disagree on dtype are still readable, normalized to the wider type:
+
+        >>> spec = {"data": {
+        ...     "0.parquet": {"subject_id": [1], "code": ["A"]},
+        ...     "1.parquet": pa.table({"subject_id": pa.array([2], pa.int32()),
+        ...                            "code": pa.array(["B"])}),
+        ... }}
+        >>> with yaml_disk(spec) as d:
+        ...     _base_frame(_shard_paths(d), {"subject_id", "code"}).collect()["subject_id"].to_list()
+        [1, 2]
     """
     if missing := [c for c in _REQUIRED_DATA_COLUMNS if c not in available]:
         raise NotAMEDSDatasetError(f"Data shards are missing required column(s): {', '.join(missing)}")
 
-    lf = pl.scan_parquet(shards, missing_columns="insert")
-    return lf.select(
-        pl.col("subject_id").cast(pl.Int64),
-        (
-            pl.col("time").cast(pl.Datetime("us"))
-            if "time" in available
-            else pl.lit(None, pl.Datetime("us")).alias("time")
-        ),
-        pl.col("code").cast(pl.String),
-        (
-            pl.col("numeric_value").cast(pl.Float64)
-            if "numeric_value" in available
-            else pl.lit(None, pl.Float64).alias("numeric_value")
-        ),
-    )
+    def normalize(shard: Path) -> pl.LazyFrame:
+        lf = pl.scan_parquet(shard)
+        present = set(lf.collect_schema())
+
+        def column(name: str, dtype: pl.DataType) -> pl.Expr:
+            if name in present:
+                return pl.col(name).cast(dtype, strict=False)
+            return pl.lit(None, dtype).alias(name)
+
+        return lf.select(
+            column("subject_id", pl.Int64),
+            column("time", pl.Datetime("us")),
+            column("code", pl.String),
+            column("numeric_value", pl.Float64),
+        )
+
+    frames = [normalize(shard) for shard in shards]
+    return frames[0] if len(frames) == 1 else pl.concat(frames, how="vertical")
 
 
 def _code_vocabulary_map(meds_dir: Path) -> pl.LazyFrame | None:
