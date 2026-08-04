@@ -87,6 +87,17 @@ def meds_datasets(draw, min_subjects: int = 1, max_subjects: int = 40):
     return rows, code_rows, n_shards
 
 
+def _rename(code: str, index: int) -> str:
+    """Rewrite a code to a fresh, unique name, preserving its ``//`` namespace.
+
+    Examples:
+        >>> _rename("LAB//GLUCOSE", 0), _rename("HR", 1)
+        ('LAB//RENAMED0', 'RENAMED1')
+    """
+    namespace, separator, _ = code.partition("//")
+    return f"{namespace}{separator}RENAMED{index}" if separator else f"RENAMED{index}"
+
+
 def _write(tmp_path, rows, code_rows, n_shards):
     """Write generated rows out as a sharded MEDS dataset, keeping subjects whole per shard."""
     (tmp_path / "data").mkdir(parents=True, exist_ok=True)
@@ -123,20 +134,56 @@ class TestPrivacyInvariants:
 
     @settings(max_examples=25, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
     @given(dataset=meds_datasets())
-    def test_no_code_ever_appears_in_the_output(self, dataset, tmp_path_factory):
-        """No code string may appear in the emitted document, at any suppression threshold.
+    def test_renaming_the_vocabulary_does_not_change_the_document_shape(self, dataset, tmp_path_factory):
+        """Renaming every code must leave the set of emitted paths untouched.
 
-        Run with the floor at 1 -- suppression effectively disabled -- because the guarantee must be
-        structural. If it only held because the floor happened to be high, it would not be a guarantee at all.
+        This is the precise statement of "no code is ever emitted", and it is the formulation that
+        works. A substring scan of the serialized document cannot: hypothesis finds within seconds
+        that a code named ``000`` occurs inside almost every sha256 digest, a code named ``0``
+        equals a shard name, and a code named ``S`` occurs inside the dtype string ``String``. None
+        of those are leaks, and no amount of length-guarding separates the real cases from the
+        coincidences.
+
+        Rename-invariance has no such ambiguity. If a code reached a key or a string value, changing
+        the code would change the document's *shape*; if it only reached a digest, the shape is
+        identical and only values move. Namespaces are renamed alongside nothing -- the part before
+        ``//`` is preserved, since namespaces are legitimately emitted and the codes within them are
+        not.
+
+        Run with the floor at 1 (suppression effectively disabled), because the guarantee must be
+        structural. If it only held because the floor happened to be high, it would not be a
+        guarantee at all.
         """
         rows, code_rows, n_shards = dataset
-        root = _write(tmp_path_factory.mktemp("meds"), rows, code_rows, n_shards)
+        vocabulary = sorted({r["code"] for r in code_rows})
+        renames = {code: _rename(code, i) for i, code in enumerate(vocabulary)}
 
         cfg = ExtractConfig(min_cell_size=1, min_numeric_cell_size=1)
-        blob = json.dumps(extract_summary_stats(root, cfg))
-        vocabulary = {r["code"] for r in code_rows}
-        leaked = {c for c in vocabulary if len(c) > 2 and c in blob}
-        assert not leaked, f"leaked codes: {sorted(leaked)}"
+        original = extract_summary_stats(
+            _write(tmp_path_factory.mktemp("meds"), rows, code_rows, n_shards), cfg
+        )
+        renamed = extract_summary_stats(
+            _write(
+                tmp_path_factory.mktemp("meds"),
+                [{**r, "code": renames[r["code"]]} for r in rows],
+                [{**r, "code": renames[r["code"]]} for r in code_rows],
+                n_shards,
+            ),
+            cfg,
+        )
+
+        original_paths = set(flatten(original)) - {"extracted_at"}
+        renamed_paths = set(flatten(renamed)) - {"extracted_at"}
+        assert original_paths == renamed_paths, (
+            "renaming the vocabulary changed the document's shape, so a code reached a key: "
+            f"{sorted(original_paths ^ renamed_paths)}"
+        )
+
+        # And the converse: the vocabulary must actually be *represented* somewhere, or the property
+        # above would hold vacuously for a tool that ignored codes entirely.
+        assert original["codes"]["digests"]["alphabetical"] != renamed["codes"]["digests"]["alphabetical"], (
+            "renaming the vocabulary did not change its digest"
+        )
 
     @settings(max_examples=25, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
     @given(dataset=meds_datasets(min_subjects=5), floor=st.integers(2, 30))
