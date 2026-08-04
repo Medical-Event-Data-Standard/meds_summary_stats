@@ -36,10 +36,14 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      # No cache here, deliberately. This job's artifacts get published, and a tag-triggered
+      # publish makes a restored cache a supply-chain path: anything able to poison the uv cache
+      # from a branch build would be baked into a release. Caching buys nothing for a single
+      # `uv build` in any case. (zizmor: cache-poisoning)
       - name: Install uv
         uses: astral-sh/setup-uv@v9.0.0
         with:
-          enable-cache: true
+          enable-cache: false
 
       - name: Build
         run: uv build
