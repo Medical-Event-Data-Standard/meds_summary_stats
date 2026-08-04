@@ -1,0 +1,46 @@
+# This workflow finds which files were changed, prints them,
+# and runs `pre-commit` on those files.
+
+# Inspired by the sktime library:
+# https://github.com/alan-turing-institute/sktime/blob/main/.github/workflows/test.yml
+
+name: Code Quality PR
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  code-quality:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup package
+        uses: ./.github/actions/setup
+        with:
+          python-version: "3.12"
+
+      - name: Find modified files
+        id: file_changes
+        uses: tj-actions/changed-files@v47.0.6
+
+      - name: List all changed files
+        env:
+          ALL_CHANGED_FILES: ${{ steps.file_changes.outputs.all_changed_files }}
+        run: echo "$ALL_CHANGED_FILES"
+
+      - name: Run pre-commits
+        env:
+          ALL_CHANGED_FILES: ${{ steps.file_changes.outputs.all_changed_files }}
+        run: |
+          # Intentional word splitting: the action output is a space-separated
+          # list of file paths.
+          # shellcheck disable=SC2086
+          uv run pre-commit run --show-diff-on-failure --files $ALL_CHANGED_FILES
