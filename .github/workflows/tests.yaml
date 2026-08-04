@@ -17,6 +17,11 @@ jobs:
 
     timeout-minutes: 30
 
+    # `secrets` is not among the contexts available to a step-level `if`, so the token is hoisted
+    # into the job environment where the Codecov steps can test it.
+    env:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
     steps:
       - uses: actions/checkout@v6.0.2
         with:
@@ -27,21 +32,23 @@ jobs:
         with:
           python-version: "3.12"
 
+      # No `--ignore=docs` here, unlike the template: this project's docs are hand-written and
+      # doctested, so skipping them in CI would let a documented example drift from real output.
       - name: Run tests
         run: >
           uv run pytest -v
-          --ignore=docs
           --cov=src
           --cov-report=xml:coverage.xml
           --cov-report=term
           --junitxml=junit.xml
 
-      # Skip Codecov on Dependabot PRs: workflow runs from Dependabot do not
-      # have access to repository secrets (a deliberate GitHub security
-      # policy), so CODECOV_TOKEN is empty and the upload fails. Coverage on
-      # dependency bumps is not meaningful anyway.
+      # Skip Codecov when there is no token to use. Two cases: Dependabot runs do not get
+      # repository secrets (a deliberate GitHub security policy), and a freshly created repository
+      # has not had its token configured yet. In both, uploading is impossible rather than broken,
+      # so failing the run would be reporting the wrong problem. `fail_ci_if_error` stays on, so a
+      # genuine upload failure with a token present is still loud.
       - name: Upload coverage to Codecov
-        if: github.actor != 'dependabot[bot]'
+        if: env.CODECOV_TOKEN != '' && github.actor != 'dependabot[bot]'
         uses: codecov/codecov-action@v6.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -50,7 +57,7 @@ jobs:
           verbose: true
 
       - name: Upload test results to Codecov
-        if: ${{ !cancelled() && github.actor != 'dependabot[bot]' }}
+        if: ${{ !cancelled() && env.CODECOV_TOKEN != '' && github.actor != 'dependabot[bot]' }}
         uses: codecov/test-results-action@v1.2.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
