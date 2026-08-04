@@ -3,38 +3,45 @@ requires = ["setuptools>=80.9.0", "setuptools-scm>=9.2", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "package_name"
+name = "meds_summary_stats"
 dynamic = ["version"] # Makes setuptools-scm manage the version
 authors = [
-  {name="Matthew McDermott", email="mattmcdermott8@gmail.com"}, # Replace with your team's details
+  {name="Matthew McDermott", email="mattmcdermott8@gmail.com"},
 ]
-description = "Add your description here"
+description = "Fast, privacy-safe summary statistics over MEDS datasets, for validating and regression-testing MEDS ETLs."
 readme = "README.md"
 requires-python = ">=3.12"
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License", # Change if not using MIT license
+    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
 dependencies = [
-] # Add your runtime dependencies here
+  "meds~=0.4.0",
+  "polars>=1.20",
+  "pyarrow",
+  "pyyaml",
+]
 
 [dependency-groups]
 dev = [
   "pre-commit<4", "ruff", "pytest", "pytest-cov", "pretty-print-directory",
+  "hypothesis", "yaml-to-disk", "meds-testing-helpers",
   # shfmt-py bundles the `shfmt` binary used by the mdformat-shfmt pre-commit
   # hook. Pinning it here (in addition to the pre-commit hook's
   # additional_dependencies) gives a single source of truth and keeps local
   # `uv run mdformat ...` runs consistent with CI pre-commit runs.
   "shfmt-py==3.12.0.2",
-] # Add your development (lint, test) dependencies here
-docs = [] # Add your documentation dependencies here (I recommend mkdocs-material)
+]
+docs = []
 
 [tool.setuptools_scm] # Required for setuptools-scm to work, even if empty
 
-[project.optional-dependencies] # Add any optional dependencies here, installable via `pip install .[extra]`
+[project.optional-dependencies]
 
-[project.scripts] # Add any console scripts here
+[project.scripts]
+extract_MEDS_summary_stats = "meds_summary_stats.__main__:extract_main"
+compare_MEDS_summary_stats = "meds_summary_stats.__main__:compare_main"
 
 [tool.pytest.ini_options] # Default pytest options
 addopts = [
@@ -50,8 +57,8 @@ markers = [] # Add any custom pytest markers here
 doctest_optionflags = ["NORMALIZE_WHITESPACE", "ELLIPSIS"]
 
 [project.urls]
-Homepage = "https://github.com/McDermottHealthAI/REPO_NAME" # Replace with your repo URL
-Issues = "https://github.com/McDermottHealthAI/REPO_NAME/issues" # Replace with your repo URL
+Homepage = "https://github.com/Medical-Event-Data-Standard/meds_summary_stats"
+Issues = "https://github.com/Medical-Event-Data-Standard/meds_summary_stats/issues"
 
 [tool.ruff] # Ruff configuration for linting and formatting
 target-version = "py312"
@@ -86,4 +93,4 @@ extend-ignore-names = ["*MEDS*", "*NRT*", "D", "L"] # Allow common abbreviations
 convention = "google"
 
 [tool.ruff.lint.isort]
-known-first-party = ["package_name"]  # Replace with your actual package name
+known-first-party = ["meds_summary_stats"]
