@@ -55,6 +55,13 @@ jobs:
           files: coverage.xml
           fail_ci_if_error: true
           verbose: true
+          # Install the Codecov CLI from PyPI rather than downloading the prebuilt binary. The
+          # binary path GPG-verifies the download against a key fetched from a keyserver, and that
+          # fetch fails on GitHub-hosted runners ("gpg: no valid OpenPGP data found" ->
+          # "Can't check signature: No public key"), taking the whole job down with it. PyPI
+          # installation is verified by the index instead and does not depend on keyserver
+          # reachability.
+          use_pypi: true
 
       - name: Upload test results to Codecov
         if: ${{ !cancelled() && env.CODECOV_TOKEN != '' && github.actor != 'dependabot[bot]' }}
