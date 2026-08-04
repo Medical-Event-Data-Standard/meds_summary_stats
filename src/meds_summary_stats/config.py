@@ -47,6 +47,11 @@ class ExtractConfig:
         moment_digest_sig_digits: Significant digits retained when hashing per-code numeric moments.
         code_metadata_only_digests: Whether to also digest the vocabulary of ``metadata/codes.parquet``
             independently of the codes actually observed in the data.
+        dataset_digest: Whether to checksum the dataset's files. ``"files"`` (the default) hashes
+            the bytes of every file the MEDS schema defines; ``"none"`` skips it. This is the
+            strictest possible identity claim -- see
+            :func:`~meds_summary_stats.extract._dataset_digest_block` for exactly what it is and is
+            not invariant to.
         emit_ontology_keys: Whether to list, in full, the keys observed within each external
             vocabulary referenced by ``parent_codes``. Those keys name published terminology concepts
             rather than anything about a subject, so this is off by default for output size, not for
@@ -58,6 +63,8 @@ class ExtractConfig:
         >>> cfg = ExtractConfig()
         >>> cfg.min_cell_size, cfg.min_numeric_cell_size, cfg.numeric_detail
         (20, 20, 'moments')
+        >>> cfg.dataset_digest
+        'files'
 
         Configs are frozen, so nothing downstream can weaken a suppression threshold in flight:
 
@@ -79,6 +86,10 @@ class ExtractConfig:
         Traceback (most recent call last):
             ...
         ValueError: numeric_detail must be one of ('moments', 'quantiles'); got 'everything'
+        >>> ExtractConfig(dataset_digest="md5")
+        Traceback (most recent call last):
+            ...
+        ValueError: dataset_digest must be one of ('none', 'files'); got 'md5'
 
         And out-of-range quantiles:
 
@@ -95,10 +106,14 @@ class ExtractConfig:
     digest_subject_thresholds: tuple[int, ...] = DEFAULT_DIGEST_THRESHOLDS
     moment_digest_sig_digits: int = 6
     code_metadata_only_digests: bool = True
+    dataset_digest: str = "files"
     emit_ontology_keys: bool = False
 
     VALID_NUMERIC_DETAIL: tuple[str, ...] = dataclasses.field(
         default=("moments", "quantiles"), init=False, repr=False, compare=False
+    )
+    VALID_DATASET_DIGEST: tuple[str, ...] = dataclasses.field(
+        default=("none", "files"), init=False, repr=False, compare=False
     )
 
     def __post_init__(self) -> None:
@@ -110,6 +125,10 @@ class ExtractConfig:
         if self.numeric_detail not in self.VALID_NUMERIC_DETAIL:
             raise ValueError(
                 f"numeric_detail must be one of {self.VALID_NUMERIC_DETAIL}; got {self.numeric_detail!r}"
+            )
+        if self.dataset_digest not in self.VALID_DATASET_DIGEST:
+            raise ValueError(
+                f"dataset_digest must be one of {self.VALID_DATASET_DIGEST}; got {self.dataset_digest!r}"
             )
         for q in self.quantiles:
             if not (0 < q < 1):
@@ -124,6 +143,7 @@ class ExtractConfig:
             >>> from pprint import pprint
             >>> pprint(ExtractConfig(quantiles=(0.5,)).to_dict())
             {'code_metadata_only_digests': True,
+             'dataset_digest': 'files',
              'digest_subject_thresholds': [20, 100, 1000],
              'emit_ontology_keys': False,
              'min_cell_size': 20,

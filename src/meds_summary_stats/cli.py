@@ -76,6 +76,15 @@ def _extract_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--dataset-digest",
+        choices=("none", "files"),
+        default=_EXTRACT_DEFAULTS.dataset_digest,
+        help=(
+            "'files' (default) checksums the bytes of every file the MEDS schema defines, so two "
+            "extractions can assert the dataset is byte-identical; 'none' skips it."
+        ),
+    )
+    parser.add_argument(
         "--emit-ontology-keys",
         action="store_true",
         help="List every key observed in each external vocabulary referenced by parent_codes.",
@@ -114,6 +123,8 @@ def _resolve_extract_config(args: argparse.Namespace) -> ExtractConfig:
         overrides["min_cell_size"] = args.min_cell_size
     if args.numeric_detail != _EXTRACT_DEFAULTS.numeric_detail:
         overrides["numeric_detail"] = args.numeric_detail
+    if args.dataset_digest != _EXTRACT_DEFAULTS.dataset_digest:
+        overrides["dataset_digest"] = args.dataset_digest
     if args.emit_ontology_keys:
         overrides["emit_ontology_keys"] = True
     return ExtractConfig.from_dict({**base.to_dict(), **overrides})

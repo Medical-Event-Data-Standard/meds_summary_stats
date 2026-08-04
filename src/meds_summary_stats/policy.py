@@ -90,6 +90,12 @@ class Rule:
         warn: Threshold above which a difference is a warning. ``None`` disables the warning tier.
         error: Threshold above which a difference is an error. ``None`` disables the error tier.
         on_change: Severity for an ``exact`` mismatch.
+        on_added: Severity when this path appears in the current document but not the baseline.
+            ``None`` defers to the policy's ``on_added_key``.
+        on_removed: Severity when this path is in the baseline but not the current document.
+            ``None`` defers to the policy's ``on_removed_key``. Override it where key churn is
+            routine rather than alarming -- per-shard file digests come and go whenever an ETL
+            changes its parallelism, which is not the same event as a statistic disappearing.
         relaxable: Whether a dataset-version change excuses this finding, under
             ``on_dataset_version_change: relax``. ``None`` means "decide by kind": numeric
             comparisons are excused, ``exact`` ones are not. Set it explicitly for the cases where
@@ -135,6 +141,8 @@ class Rule:
     warn: float | None = None
     error: float | None = None
     on_change: Severity = Severity.ERROR
+    on_added: Severity | None = None
+    on_removed: Severity | None = None
     relaxable: bool | None = None
 
     @property
@@ -171,7 +179,8 @@ class Rule:
         """
         if "path" not in raw:
             raise ValueError("Every rule needs a 'path'")
-        if unknown := sorted(set(raw) - {"path", "kind", "warn", "error", "on_change", "relaxable"}):
+        known_keys = {"path", "kind", "warn", "error", "on_change", "on_added", "on_removed", "relaxable"}
+        if unknown := sorted(set(raw) - known_keys):
             raise ValueError(f"Unknown rule keys for path {raw['path']!r}: {unknown}")
         try:
             kind = Kind(raw.get("kind", "exact"))
@@ -185,6 +194,8 @@ class Rule:
             warn=raw.get("warn"),
             error=raw.get("error"),
             on_change=Severity(raw.get("on_change", "error")),
+            on_added=Severity(raw["on_added"]) if "on_added" in raw else None,
+            on_removed=Severity(raw["on_removed"]) if "on_removed" in raw else None,
             relaxable=raw.get("relaxable"),
         )
 
@@ -220,6 +231,24 @@ DEFAULT_RULES: tuple[dict[str, Any], ...] = (
     {"path": "dataset.created_at", "kind": "ignore"},
     {"path": "dataset.etl_version", "kind": "ignore"},
     {"path": "dataset.location_uri", "kind": "ignore"},
+    # The dataset checksum. Deliberately a warning rather than an error: it is a digest of bytes,
+    # so the same rows rewritten by a different parquet writer move it without the data having
+    # changed. When that happens the digest moves and every statistic stays put, which is itself
+    # the diagnosis. Promote it to `error` once you have confirmed your ETL is byte-reproducible.
+    {"path": "dataset_digest.**", "kind": "exact", "on_change": "warning"},
+    {"path": "dataset_digest.method", "kind": "exact"},
+    # Per-shard digests appear and disappear whenever an ETL changes its parallelism, which is a
+    # layout event rather than a data one -- `layout` reports it, and reporting it twice at error
+    # severity would just be noise.
+    {
+        "path": "dataset_digest.by_file.*",
+        "kind": "exact",
+        "on_change": "warning",
+        "on_added": "warning",
+        "on_removed": "warning",
+    },
+    # dataset.json carries created_at and etl_version, so its digest changes on every rerun.
+    {"path": "dataset_digest.dataset_metadata", "kind": "ignore"},
     # Identity and schema: any change is a regression until proven otherwise.
     {"path": "stats_schema_version", "kind": "exact"},
     {"path": "dataset.**", "kind": "exact"},

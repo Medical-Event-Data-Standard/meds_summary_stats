@@ -83,7 +83,10 @@ def test_shard_layout_does_not_change_the_statistics(generated_sample_MEDS: Path
 
     changed = {f.path for f in report.findings}
     assert changed, "expected the layout block itself to differ"
-    assert all(p.startswith("layout.") for p in changed), sorted(changed)
+    assert {p.split(".")[0] for p in changed} == {"layout", "dataset_digest"}, sorted(changed)
+
+    digest_severities = {str(f.severity) for f in report.findings if f.path.startswith("dataset_digest.")}
+    assert digest_severities == {"warning"}, "digest findings must stay advisory on a re-shard"
 
 
 @pytest.mark.parametrize(
@@ -439,3 +442,105 @@ def test_mapping_coverage_is_bounded_when_codes_span_vocabularies(tmp_path: Path
     assert per_vocabulary == {"LOINC": 150, "SNOMED": 100}
     assert sum(per_vocabulary.values()) > stats["counts"]["n_measurements"]
     assert ontology["n_codes_in_multiple_vocabularies"] == 2
+
+
+class TestDatasetDigest:
+    """The dataset checksum: 'is this the same dataset at all?', asked independently of the stats."""
+
+    @staticmethod
+    def _copy(source: Path, target: Path) -> Path:
+        shutil.copytree(source, target)
+        return target
+
+    def test_a_faithful_copy_has_the_same_digest(self, generated_sample_MEDS: Path, tmp_path: Path):
+        copy = self._copy(generated_sample_MEDS, tmp_path / "copy")
+        assert (
+            extract_summary_stats(generated_sample_MEDS)["dataset_digest"]["combined"]
+            == extract_summary_stats(copy)["dataset_digest"]["combined"]
+        )
+
+    def test_any_data_change_moves_the_digest(self, dataset_copy: Path, generated_sample_MEDS: Path):
+        baseline = extract_summary_stats(generated_sample_MEDS)["dataset_digest"]
+        _mutate_shard(dataset_copy, lambda df: df.head(df.height - 1))
+        assert extract_summary_stats(dataset_copy)["dataset_digest"]["combined"] != baseline["combined"]
+
+    def test_files_outside_the_meds_schema_are_ignored(self, dataset_copy: Path, generated_sample_MEDS: Path):
+        """Task labels, caches, and stray files must not make two copies compare unequal."""
+        baseline = extract_summary_stats(generated_sample_MEDS)["dataset_digest"]
+
+        (dataset_copy / "task_labels").mkdir()
+        pl.DataFrame({"subject_id": [1], "boolean_value": [True]}).write_parquet(
+            dataset_copy / "task_labels" / "mortality.parquet"
+        )
+        (dataset_copy / "README.md").write_text("notes about this dataset\n")
+        (dataset_copy / "metadata" / "scratch.json").write_text('{"cached": true}\n')
+        (dataset_copy / "data" / "NOTES.txt").write_text("not a shard\n")
+
+        assert extract_summary_stats(dataset_copy)["dataset_digest"]["combined"] == baseline["combined"]
+
+    def test_dataset_json_is_excluded_from_the_combined_digest(
+        self, dataset_copy: Path, generated_sample_MEDS: Path
+    ):
+        """It carries created_at and etl_version, so folding it in would invalidate every rerun."""
+        baseline = extract_summary_stats(generated_sample_MEDS)["dataset_digest"]
+        (dataset_copy / "metadata" / "dataset.json").write_text(
+            json.dumps({"dataset_name": "x", "created_at": "2026-08-04T12:00:00", "etl_version": "9.9"})
+        )
+        current = extract_summary_stats(dataset_copy)["dataset_digest"]
+
+        assert current["combined"] == baseline["combined"]
+        assert current["dataset_metadata"] != baseline["dataset_metadata"]
+
+    def test_renaming_a_shard_does_not_change_the_combined_digest(
+        self, dataset_copy: Path, generated_sample_MEDS: Path
+    ):
+        """`combined` hashes the set of file contents, not their paths.
+
+        Shard naming is tracked separately by ``layout.shard_names_digest``, so a rename shows up
+        there rather than as a spurious "the data changed" signal.
+        """
+        baseline = extract_summary_stats(generated_sample_MEDS)
+        shard = sorted((dataset_copy / "data").rglob("*.parquet"))[0]
+        shard.rename(shard.with_name("renamed.parquet"))
+        current = extract_summary_stats(dataset_copy)
+
+        assert current["dataset_digest"]["combined"] == baseline["dataset_digest"]["combined"]
+        assert current["layout"]["shard_names_digest"] != baseline["layout"]["shard_names_digest"]
+        assert set(current["dataset_digest"]["by_file"]) != set(baseline["dataset_digest"]["by_file"])
+
+    def test_re_encoding_moves_the_digest_but_no_statistic(
+        self, dataset_copy: Path, generated_sample_MEDS: Path
+    ):
+        """The documented false positive, and the diagnosis that goes with it.
+
+        The digest is over bytes, so rewriting identical rows with different compression changes it. That is
+        not a data regression, and the report says as much: the digest is the *only* thing that moves. Under
+        the default policy it is a warning, not an error, precisely so this does not fail anyone's CI.
+        """
+        baseline = extract_summary_stats(generated_sample_MEDS)
+        for shard in sorted((dataset_copy / "data").rglob("*.parquet")):
+            pl.read_parquet(shard).write_parquet(shard, compression="uncompressed")
+        current = extract_summary_stats(dataset_copy)
+
+        assert current["dataset_digest"]["combined"] != baseline["dataset_digest"]["combined"]
+
+        report = compare_summary_stats(baseline, current)
+        assert not report.failed, [f.path for f in report.findings if str(f.severity) == "error"]
+        assert {f.path.split(".")[0] for f in report.findings} == {"dataset_digest"}
+
+    def test_the_digest_can_be_turned_off(self, generated_sample_MEDS: Path):
+        stats = extract_summary_stats(generated_sample_MEDS, ExtractConfig(dataset_digest="none"))
+        assert stats["dataset_digest"] == {"method": "none"}
+
+    def test_per_file_digests_are_dropped_for_wide_datasets(self, tmp_path: Path):
+        """A thousand-shard dataset must not produce a thousand-line block."""
+        (tmp_path / "data").mkdir(parents=True)
+        for i in range(70):
+            pl.DataFrame(
+                {"subject_id": [i], "code": ["A"]}, schema={"subject_id": pl.Int64, "code": pl.String}
+            ).write_parquet(tmp_path / "data" / f"{i}.parquet")
+
+        block = extract_summary_stats(tmp_path)["dataset_digest"]
+        assert block["n_files"] == 70
+        assert block["by_file"] is None
+        assert block["combined"].startswith("sha256:")
