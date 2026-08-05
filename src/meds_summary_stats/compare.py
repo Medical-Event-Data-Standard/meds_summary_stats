@@ -173,6 +173,91 @@ def _severity_for(rule: Rule, magnitude: float) -> Severity | None:
     return None
 
 
+def _compare_collection(path: str, baseline: list, current: list, rule: Rule) -> Finding | None:
+    """Compare two list-valued leaves by membership rather than by position.
+
+    :func:`~meds_summary_stats.flatten.flatten` keeps lists of scalars whole precisely so this can
+    happen: the interesting facts about a column list are which members appeared and which
+    disappeared, and both are lost if the list is compared index by index.
+
+    Args:
+        path: The flattened path.
+        baseline: The baseline list.
+        current: The current list.
+        rule: The governing rule.
+
+    Returns:
+        A finding naming the added and removed members, or ``None`` if the lists are equal.
+
+    Examples:
+        >>> rule = Rule(path="**", kind=Kind.EXACT)
+        >>> _compare_collection("layout.extra_data_columns", ["a", "b"], ["a", "b"], rule) is None
+        True
+
+        One added column is one finding that names it, not one per shifted index:
+
+        >>> f = _compare_collection("layout.extra_data_columns", ["b", "c"], ["a", "b", "c"], rule)
+        >>> f.kind, f.message
+        ('set', "added 'a'")
+
+        Additions and removals are reported together:
+
+        >>> f = _compare_collection("layout.code_metadata_columns", ["itemid", "x"], ["y", "x"], rule)
+        >>> print(f.message)
+        added 'y'; removed 'itemid'
+
+        Same members in a different order is a real change for an ordered config, so it is still
+        reported -- but it is described as what it is:
+
+        >>> f = _compare_collection("config.quantiles", [0.1, 0.9], [0.9, 0.1], rule)
+        >>> print(f.message)
+        reordered, same members
+
+        Unhashable members (never produced by extraction, but policies are user-facing) fall back
+        to whole-value equality rather than crashing:
+
+        >>> f = _compare_collection("x", [[1]], [[2]], rule)
+        >>> f.kind, f.message
+        ('exact', 'changed from [[1]] to [[2]]')
+    """
+    if baseline == current:
+        return None
+
+    severity = rule.on_change if rule.kind is Kind.EXACT else Severity.ERROR
+    try:
+        before, after = set(baseline), set(current)
+    except TypeError:
+        return Finding(
+            path=path,
+            severity=severity,
+            kind="exact",
+            baseline=baseline,
+            current=current,
+            message=f"changed from {baseline!r} to {current!r}",
+        )
+
+    added = sorted(after - before, key=repr)
+    removed = sorted(before - after, key=repr)
+    if added or removed:
+        parts = []
+        if added:
+            parts.append("added " + ", ".join(repr(v) for v in added))
+        if removed:
+            parts.append("removed " + ", ".join(repr(v) for v in removed))
+        message = "; ".join(parts)
+    else:
+        message = "reordered, same members"
+
+    return Finding(
+        path=path,
+        severity=severity,
+        kind="set",
+        baseline=baseline,
+        current=current,
+        message=message,
+    )
+
+
 def _compare_leaf(path: str, baseline: Any, current: Any, rule: Rule) -> Finding | None:
     """Compare one path's two values under its rule.
 
@@ -226,9 +311,19 @@ def _compare_leaf(path: str, baseline: Any, current: Any, rule: Rule) -> Finding
         ...                   Rule(path="**", kind=Kind.RELATIVE, error=0.01))
         >>> f.kind, f.message
         ('exact', 'changed from 100 to None')
+
+        Two list-valued leaves are diffed by membership -- see :func:`_compare_collection`:
+
+        >>> f = _compare_leaf("layout.extra_data_columns", ["b"], ["a", "b"],
+        ...                   Rule(path="**", kind=Kind.EXACT))
+        >>> f.kind, f.message
+        ('set', "added 'a'")
     """
     if rule.kind is Kind.IGNORE:
         return None
+
+    if isinstance(baseline, list) and isinstance(current, list):
+        return _compare_collection(path, baseline, current, rule)
 
     if rule.kind is Kind.EXACT or not (_is_number(baseline) and _is_number(current)):
         if baseline == current or (

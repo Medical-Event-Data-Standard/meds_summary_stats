@@ -299,7 +299,7 @@ DEFAULT_RULES: tuple[dict[str, Any], ...] = (
     {"path": "stats_schema_version", "kind": "exact"},
     {"path": "dataset.**", "kind": "exact"},
     {"path": "layout.**", "kind": "exact"},
-    {"path": "layout.shard_names.**", "kind": "exact", "on_change": "warning"},
+    {"path": "layout.shard_names", "kind": "exact", "on_change": "warning"},
     # Headline volume. The subject count is the tightest, since it is the number an ETL change is
     # least entitled to move.
     {"path": "**", "kind": "relative", "warn": 0.001, "error": 0.01},
