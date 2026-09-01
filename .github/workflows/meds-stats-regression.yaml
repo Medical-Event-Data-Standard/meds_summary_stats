@@ -98,7 +98,7 @@ jobs:
         with:
           python-version: ${{ inputs.python-version }}
 
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
           enable-cache: true
           cache-suffix: meds-summary-stats
