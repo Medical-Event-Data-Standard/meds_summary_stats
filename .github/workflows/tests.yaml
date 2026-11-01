@@ -49,7 +49,7 @@ jobs:
       # genuine upload failure with a token present is still loud.
       - name: Upload coverage to Codecov
         if: env.CODECOV_TOKEN != '' && github.actor != 'dependabot[bot]'
-        uses: codecov/codecov-action@v7.0.0
+        uses: codecov/codecov-action@v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage.xml
