@@ -24,7 +24,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-  "pre-commit<4", "ruff", "pytest", "pytest-cov", "pretty-print-directory",
+  "pre-commit<5", "ruff", "pytest", "pytest-cov", "pretty-print-directory",
   "hypothesis", "yaml-to-disk", "meds-testing-helpers",
   # Only used by doctests that need to control parquet dtypes precisely; polars reads and writes
   # parquet without it, so it is not a runtime dependency of the package.
@@ -33,7 +33,7 @@ dev = [
   # hook. Pinning it here (in addition to the pre-commit hook's
   # additional_dependencies) gives a single source of truth and keeps local
   # `uv run mdformat ...` runs consistent with CI pre-commit runs.
-  "shfmt-py==3.12.0.2",
+  "shfmt-py==4.2.0",
 ]
 docs = []
 
