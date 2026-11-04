@@ -818,7 +818,8 @@ def _plan_chunks(shards: list[Path], available: set[str], max_rows: int | None) 
     3. Some subject spans shards. That is non-conformant, but this tool exists to read broken ETL
        output, so rather than give up the whole dataset is split by subject-id range instead.
 
-    Telling 2 from 3 costs one pass over ``subject_id`` alone; the row counts are parquet metadata.
+    Telling 2 from 3 costs one pass over ``subject_id`` alone, made one shard at a time so that its
+    memory is bounded by a shard rather than by the dataset; the row counts are parquet metadata.
 
     Args:
         shards: The data shard paths.
@@ -872,13 +873,18 @@ def _plan_chunks(shards: list[Path], available: set[str], max_rows: int | None) 
     if sum(rows) <= max_rows:
         return [_base_frame(shards, available)]
 
-    counts = (
-        pl.concat(
-            [_base_frame([s], available).select("subject_id", shard=pl.lit(i)) for i, s in enumerate(shards)]
-        )
-        .group_by("shard", "subject_id")
-        .agg(n=pl.len())
-        .collect(engine="streaming")
+    # Counted shard by shard rather than in one query over the concatenated shards. The result is
+    # the same, since the shard is part of the key, but on a 1.1-billion-row cohort the single query
+    # peaked at 7-8 GB, more than the chunked aggregation this plan exists to bound.
+    counts = pl.concat(
+        [
+            _base_frame([s], available)
+            .group_by("subject_id")
+            .agg(n=pl.len())
+            .select(pl.lit(i).alias("shard"), "subject_id", "n")
+            .collect(engine="streaming")
+            for i, s in enumerate(shards)
+        ]
     )
     if counts["subject_id"].is_duplicated().any():
         everything = _base_frame(shards, available)
