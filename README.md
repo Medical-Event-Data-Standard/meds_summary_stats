@@ -149,7 +149,7 @@ Re-extracting the same dataset reproduces it exactly, which is the property the 
 >>> from meds_summary_stats.compare import compare_summary_stats
 >>> from meds_summary_stats.report import render_text
 >>> print(render_text(compare_summary_stats(baseline, baseline)))
-PASS - 199 paths checked, 4 ignored, no findings.
+PASS - 197 paths checked, 4 ignored, no findings.
 
 ```
 

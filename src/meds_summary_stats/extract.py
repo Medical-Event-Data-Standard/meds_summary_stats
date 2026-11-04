@@ -32,7 +32,7 @@ from .ontology import is_recognized, key_expr, vocabulary_expr
 #:
 #: Bumped whenever the meaning of an existing field changes or a digest encoding changes. Comparison
 #: refuses to diff across different values.
-STATS_SCHEMA_VERSION = 1
+STATS_SCHEMA_VERSION = 2
 
 #: Fractions of total measurement volume for which vocabulary-concentration counts are reported.
 _CONCENTRATION_LEVELS: tuple[float, ...] = (0.5, 0.9, 0.99)
@@ -1507,7 +1507,12 @@ def _ontology_block(
     if "parent_codes" not in lf.collect_schema():
         return {"present": False}
 
-    per_code_parents = lf.select("code", n_parents=pl.col("parent_codes").list.len().fill_null(0)).collect()
+    # `drop_nulls` matches what `links` below does after exploding, so `n_codes_with_parents` and
+    # `parents_per_code` count the same parents the per-vocabulary breakdown does. Without it a
+    # `[null]` entry counts as one parent that belongs to no vocabulary.
+    per_code_parents = lf.select(
+        "code", n_parents=pl.col("parent_codes").list.drop_nulls().list.len().fill_null(0)
+    ).collect()
     links = (
         lf.select("code", "parent_codes")
         .explode("parent_codes", empty_as_null=True)
@@ -1626,6 +1631,20 @@ def _code_metadata_block(
         >>> with yaml_disk({"data": {}}) as d:
         ...     _code_metadata_block(d, observed, None, None, None, ExtractConfig())
         {'present': False}
+
+        Neither counter treats empty content as present. A blank description is not a description,
+        and a ``parent_codes`` list whose only element is null carries no parent -- both are shapes
+        real ETLs emit, and counting them makes a cohort look better-annotated than it is:
+
+        >>> spec = {"metadata": {"codes.parquet": {
+        ...     "code": ["HR", "GLU", "TEMP"],
+        ...     "description": ["Heart rate", "", "   "],
+        ...     "parent_codes": [["LOINC/8867-4"], [None], [None, "SNOMED/1"]],
+        ... }}}
+        >>> with yaml_disk(spec) as d:
+        ...     block = _code_metadata_block(d, observed, None, None, None, ExtractConfig())
+        >>> block["n_with_description"], block["n_with_parent_codes"]
+        (1, 2)
     """
     fp = meds_dir / meds.code_metadata_filepath
     if not fp.is_file():
@@ -1640,13 +1659,28 @@ def _code_metadata_block(
     block: dict[str, Any] = {
         "present": True,
         "n_codes": metadata_codes.len(),
+        # "Has a description" means it carries usable text: an empty or whitespace-only string is
+        # an absent description that happens not to be null, and counting it inflates coverage.
         "n_with_description": (
-            int(lf.select(pl.col("description").is_not_null().sum()).collect().item())
+            int(
+                lf.select((pl.col("description").fill_null("").str.strip_chars() != "").sum())
+                .collect()
+                .item()
+            )
             if "description" in schema
             else None
         ),
+        # `drop_nulls` before measuring length: a `parent_codes` value of `[null]` is a non-empty
+        # list carrying no parent, and ETLs do emit them. Counting it as coverage inverts the
+        # comparison -- an ETL that stops emitting null-filled lists then looks like it *lost*
+        # ontology mappings. This also makes the count agree with `_ontology_block`, which has
+        # always dropped nulls after exploding the same column.
         "n_with_parent_codes": (
-            int(lf.select((pl.col("parent_codes").list.len().fill_null(0) > 0).sum()).collect().item())
+            int(
+                lf.select((pl.col("parent_codes").list.drop_nulls().list.len().fill_null(0) > 0).sum())
+                .collect()
+                .item()
+            )
             if "parent_codes" in schema
             else None
         ),
@@ -2067,8 +2101,12 @@ def read_summary_stats(path: str | Path) -> dict[str, Any]:
         ValueError: If the file is not a stats document this version understands.
 
     Examples:
+        Written against ``STATS_SCHEMA_VERSION`` rather than a literal, so this does not have to be
+        edited on every bump:
+
         >>> with tempfile.TemporaryDirectory() as tmp:
-        ...     fp = write_summary_stats({"stats_schema_version": 1, "counts": {}}, Path(tmp) / "s.json")
+        ...     doc = {"stats_schema_version": STATS_SCHEMA_VERSION, "counts": {}}
+        ...     fp = write_summary_stats(doc, Path(tmp) / "s.json")
         ...     sorted(read_summary_stats(fp))
         ['counts', 'stats_schema_version']
 
@@ -2079,7 +2117,7 @@ def read_summary_stats(path: str | Path) -> dict[str, Any]:
         ...     read_summary_stats(fp)
         Traceback (most recent call last):
             ...
-        ValueError: .../s.json has stats_schema_version 99; this build understands 1
+        ValueError: .../s.json has stats_schema_version 99; this build understands ...
 
         As is a JSON file that is not a stats document at all:
 

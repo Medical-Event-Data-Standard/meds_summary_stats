@@ -393,6 +393,6 @@ information.
 
 ```python
 >>> stats["config"]["min_cell_size"], stats["stats_schema_version"]
-(1, 1)
+(1, 2)
 
 ```

@@ -309,7 +309,7 @@
     "n_subjects_in_splits_without_data": 0,
     "present": true
   },
-  "stats_schema_version": 1,
+  "stats_schema_version": 2,
   "time": {
     "by_year": {
       "2018": {

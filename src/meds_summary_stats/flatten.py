@@ -35,7 +35,15 @@ def escape(key: str) -> str:
 def flatten(document: Any, prefix: str = "") -> dict[str, Any]:
     r"""Flatten a nested document to a map from dotted path to scalar.
 
-    Lists are flattened by index. Empty containers are preserved as leaves, because "this mapping is
+    A list of scalars is kept whole as a single leaf, because every such list in a stats document
+    is an unordered collection -- column names, shard names, configured quantiles. Indexing them
+    positionally would make inserting one member look like a change to every member after it: add
+    one column to ``layout.extra_data_columns`` and each subsequent index reports
+    ``changed from 'emar_id' to 'drg_severity'``, which is twenty findings describing one event and
+    never actually names the added column. Comparison diffs these leaves by membership instead.
+
+    Lists that contain containers are still flattened by index, where position is the only
+    identifier an element has. Empty containers are preserved as leaves, because "this mapping is
     empty" is itself a fact worth diffing -- an ETL that stops emitting any split at all should not
     look identical to one that never had the key.
 
@@ -51,10 +59,15 @@ def flatten(document: Any, prefix: str = "") -> dict[str, Any]:
         >>> pprint(flatten({"counts": {"n_subjects": 10, "nested": {"a": 1}}, "ok": True}))
         {'counts.n_subjects': 10, 'counts.nested.a': 1, 'ok': True}
 
-        Lists index positionally:
+        A list of scalars stays whole, so it can be diffed by membership:
 
         >>> pprint(flatten({"cols": ["a", "b"]}))
-        {'cols.0': 'a', 'cols.1': 'b'}
+        {'cols': ['a', 'b']}
+
+        Lists of containers still index positionally, position being their only identifier:
+
+        >>> pprint(flatten({"rows": [{"a": 1}, {"a": 2}]}))
+        {'rows.0.a': 1, 'rows.1.a': 2}
 
         Empty containers survive as leaves rather than vanishing:
 
@@ -80,6 +93,8 @@ def flatten(document: Any, prefix: str = "") -> dict[str, Any]:
             out.update(flatten(value, path))
         return out
     if isinstance(document, list) and document:
+        if all(not isinstance(value, dict | list) for value in document):
+            return {prefix: document}
         out = {}
         for i, value in enumerate(document):
             out.update(flatten(value, f"{prefix}{SEP}{i}" if prefix else str(i)))
