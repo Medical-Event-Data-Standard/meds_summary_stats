@@ -89,6 +89,20 @@ def test_shard_layout_does_not_change_the_statistics(generated_sample_MEDS: Path
     assert digest_severities == {"warning"}, "digest findings must stay advisory on a re-shard"
 
 
+def test_chunked_extraction_matches_a_single_pass(generated_sample_MEDS: Path):
+    """Aggregating in bounded chunks must not move a single field of the document.
+
+    Chunking is how extraction keeps peak memory flat on large datasets, and it is on by default. The
+    sample has two shards of a few thousand rows, so this budget splits each between its subjects; shard
+    grouping and the fallback for subjects spanning shards are covered in ``test_properties.py``.
+    """
+    whole = extract_summary_stats(generated_sample_MEDS, max_rows_per_chunk=None)
+    chunked = extract_summary_stats(generated_sample_MEDS, max_rows_per_chunk=500)
+    whole.pop("extracted_at")
+    chunked.pop("extracted_at")
+    assert whole == chunked
+
+
 @pytest.mark.parametrize(
     ("description", "mutate", "expected_path"),
     [

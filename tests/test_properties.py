@@ -23,11 +23,18 @@ import hypothesis.strategies as st
 import polars as pl
 import pytest
 from hypothesis import HealthCheck, assume, given, settings
+from polars.testing import assert_frame_equal
 
 from meds_summary_stats.compare import compare_summary_stats, relative_delta
 from meds_summary_stats.config import SUPPRESSED, ExtractConfig
 from meds_summary_stats.digests import digest, format_moment, ordered_by
-from meds_summary_stats.extract import extract_summary_stats
+from meds_summary_stats.extract import (
+    _aggregate,
+    _code_vocabulary_map,
+    _plan_chunks,
+    _shard_paths,
+    extract_summary_stats,
+)
 from meds_summary_stats.flatten import escape, flatten, matches, specificity
 from meds_summary_stats.ontology import key_expr, split_parent_code, vocabulary_expr
 
@@ -101,8 +108,13 @@ def _rename(code: str, index: int) -> str:
     return f"RENAMED{index}"
 
 
-def _write(tmp_path, rows, code_rows, n_shards):
-    """Write generated rows out as a sharded MEDS dataset, keeping subjects whole per shard."""
+def _write(tmp_path, rows, code_rows, n_shards, scatter: bool = False):
+    """Write generated rows out as a sharded MEDS dataset.
+
+    By default each subject is kept whole within one shard, as MEDS ETLs produce. With ``scatter``,
+    rows are dealt round-robin across shards instead, so a subject spans several of them -- a
+    non-conformant layout that extraction must still read correctly.
+    """
     (tmp_path / "data").mkdir(parents=True, exist_ok=True)
     (tmp_path / "metadata").mkdir(parents=True, exist_ok=True)
 
@@ -119,10 +131,11 @@ def _write(tmp_path, rows, code_rows, n_shards):
 
     subjects = frame["subject_id"].unique().sort().to_list()
     for shard in range(n_shards):
-        assigned = subjects[shard::n_shards]
-        frame.filter(pl.col("subject_id").is_in(assigned)).write_parquet(
-            tmp_path / "data" / f"{shard}.parquet"
-        )
+        if scatter:
+            part = frame.gather_every(n_shards, offset=shard)
+        else:
+            part = frame.filter(pl.col("subject_id").is_in(subjects[shard::n_shards]))
+        part.write_parquet(tmp_path / "data" / f"{shard}.parquet")
 
     pl.DataFrame(
         code_rows,
@@ -230,6 +243,54 @@ class TestPrivacyInvariants:
         first.pop("extracted_at")
         second.pop("extracted_at")
         assert first == second
+
+
+class TestChunkedAggregation:
+    """Aggregating in bounded chunks is how extraction keeps memory flat; it must change nothing.
+
+    Distinct-subject counts only add across chunks that share no subject, so the planner has to keep every
+    subject whole -- including on a non-conformant dataset that scatters a subject across shards, which is
+    exactly the kind of broken output this tool exists to read.
+    """
+
+    @settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @given(dataset=meds_datasets(), max_rows=st.integers(1, 60), scatter=st.booleans())
+    def test_chunking_never_changes_an_aggregate(self, dataset, max_rows, scatter, tmp_path_factory):
+        rows, code_rows, n_shards = dataset
+        root = _write(tmp_path_factory.mktemp("meds"), rows, code_rows, n_shards, scatter=scatter)
+        shards = _shard_paths(root)
+        available = {"subject_id", "time", "code", "numeric_value"}
+        cfg = ExtractConfig(numeric_detail="quantiles")
+        vocab_map = _code_vocabulary_map(root)
+
+        whole = _aggregate(_plan_chunks(shards, available, None), cfg, vocab_map)
+        chunks = _plan_chunks(shards, available, max_rows)
+        chunked = _aggregate(chunks, cfg, vocab_map)
+
+        assert sorted(whole) == sorted(chunked)
+        for name, expected in whole.items():
+            keys = [k for k in ("subject_id", "code", "year", "vocabulary") if k in expected.columns]
+            actual = chunked[name]
+            if keys:
+                expected, actual = expected.sort(keys), actual.sort(keys)
+            # Moments pooled across chunks agree to rounding, not bit-for-bit; every count is exact
+            # because the tolerance is far below one.
+            assert_frame_equal(expected, actual, rel_tol=1e-9, abs_tol=1e-9)
+
+    @settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @given(dataset=meds_datasets(), max_rows=st.integers(1, 60), scatter=st.booleans())
+    def test_a_chunk_overshoots_its_budget_by_less_than_one_subject(
+        self, dataset, max_rows, scatter, tmp_path_factory
+    ):
+        """The budget is a bound, give or take the one subject that cannot be split."""
+        rows, code_rows, n_shards = dataset
+        root = _write(tmp_path_factory.mktemp("meds"), rows, code_rows, n_shards, scatter=scatter)
+        available = {"subject_id", "time", "code", "numeric_value"}
+
+        for chunk in _plan_chunks(_shard_paths(root), available, max_rows):
+            sizes = chunk.group_by("subject_id").agg(n=pl.len()).collect()["n"]
+            if sizes.len():
+                assert sizes.sum() < max_rows + sizes.max(), (max_rows, sizes.to_list())
 
 
 class TestDigests:

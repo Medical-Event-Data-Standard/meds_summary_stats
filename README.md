@@ -418,14 +418,24 @@ input/output/exit-code tables.
 
 ## Performance
 
-One `scan_parquet` per shard, normalized and concatenated, then a handful of aggregates collected
-together on the polars streaming engine so the common scan is shared. The dataset is read a small
-fixed number of times regardless of its size, and the only frames materialized are per-subject and
-per-code — both orders of magnitude smaller than the data.
+Peak memory is bounded by a row budget, not by the size of the dataset. The per-subject and
+per-code aggregates count distinct `(subject, time)` and `(subject, code)` pairs, and over a whole
+dataset that state grows with every row read, so they are run in chunks of about
+`--max-rows-per-chunk` rows (default 10 million), collected one after another and combined exactly.
+Within a chunk the aggregates are collected together on the polars streaming engine, so the chunk is
+read once.
+
+Combining is exact only if no subject is split between chunks, so chunks follow subjects. MEDS
+shards hold disjoint sets of subjects, so consecutive shards are grouped up to the budget and an
+oversized shard is cut between subjects. A dataset where one subject spans shards is cut by subject
+across all shards instead. That layout is non-conformant, but the tool still has to read it. The
+budget only schedules the work: it is not recorded in the output, and the statistics are the same
+for any value of it.
 
 The default `numeric-detail: moments` needs no sorting. `quantiles` adds full-column quantiles over
-`numeric_value` and `time`, which does require materializing those columns; it is opt-in for that
-reason. Per-subject and per-code quantiles are always computed, since those frames are small.
+`numeric_value` and `time`, which cannot be combined from chunks and so does materialize those two
+columns; it is opt-in for that reason. Per-subject and per-code quantiles are always computed, since
+those frames are small.
 
 ## Installation
 
