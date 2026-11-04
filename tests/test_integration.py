@@ -444,6 +444,53 @@ def test_mapping_coverage_is_bounded_when_codes_span_vocabularies(tmp_path: Path
     assert ontology["n_codes_in_multiple_vocabularies"] == 2
 
 
+@pytest.mark.parametrize("parent_codes_dtype", [pl.Null, pl.List(pl.Null)], ids=["null", "list_of_null"])
+def test_null_typed_code_metadata_columns_read_like_typed_nulls(tmp_path: Path, parent_codes_dtype):
+    """An all-null ``description`` or ``parent_codes`` column may be written with a null dtype.
+
+    That is the dtype polars and pyarrow infer for a column holding nothing but ``None``, so an ETL
+    that emits no descriptions, or no ontology links, writes exactly this. It carries the same
+    information as a ``String`` / ``List(String)`` column of nulls and must produce the same
+    statistics instead of crashing. Only the layout block, which reports dtypes as written, and the
+    file checksums may tell the two apart.
+    """
+
+    def build(root: Path, description_dtype: pl.DataType, parent_codes_dtype: pl.DataType) -> Path:
+        (root / "data").mkdir(parents=True)
+        (root / "metadata").mkdir(parents=True)
+        pl.DataFrame(
+            {
+                "subject_id": [i // 4 for i in range(400)],
+                "time": [datetime(2020, 1, 1 + (i % 28)) for i in range(400)],
+                "code": [f"C{i % 5}" for i in range(400)],
+                "numeric_value": [float(i % 17) for i in range(400)],
+            },
+            schema={
+                "subject_id": pl.Int64,
+                "time": pl.Datetime("us"),
+                "code": pl.String,
+                "numeric_value": pl.Float32,
+            },
+        ).write_parquet(root / "data" / "0.parquet")
+        pl.DataFrame(
+            {"code": [f"C{i}" for i in range(5)], "description": [None] * 5, "parent_codes": [None] * 5},
+            schema={"code": pl.String, "description": description_dtype, "parent_codes": parent_codes_dtype},
+        ).write_parquet(root / "metadata" / "codes.parquet")
+        return root
+
+    typed = extract_summary_stats(build(tmp_path / "typed", pl.String, pl.List(pl.String)))
+    untyped = extract_summary_stats(build(tmp_path / "untyped", pl.Null, parent_codes_dtype))
+
+    def comparable(stats: dict) -> dict:
+        skip = ("extracted_at", "dataset_digest.", "layout.code_metadata_columns.")
+        return {path: value for path, value in flatten(stats).items() if not path.startswith(skip)}
+
+    assert comparable(untyped) == comparable(typed)
+    assert untyped["code_metadata"]["n_with_description"] == 0
+    assert untyped["code_metadata"]["n_with_parent_codes"] == 0
+    assert untyped["layout"]["code_metadata_columns"]["description"] == str(pl.Null)
+
+
 class TestDatasetDigest:
     """The dataset checksum: 'is this the same dataset at all?', asked independently of the stats."""
 

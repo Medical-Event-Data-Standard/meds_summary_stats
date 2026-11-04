@@ -679,6 +679,59 @@ def _base_frame(shards: list[Path], available: set[str]) -> pl.LazyFrame:
     return frames[0] if len(frames) == 1 else pl.concat(frames, how="vertical")
 
 
+#: The MEDS dtypes of the optional code-metadata columns read here, for typing ones written null.
+_CODE_METADATA_DTYPES: dict[str, pl.DataType] = {
+    "description": pl.String,
+    "parent_codes": pl.List(pl.String),
+}
+
+
+def _scan_code_metadata(fp: Path) -> pl.LazyFrame:
+    """Scan ``metadata/codes.parquet``, typing any column that was written with a null dtype.
+
+    A column holding nothing but nulls is often *written* null-typed: that is the dtype polars and
+    pyarrow infer for an all-``None`` column, so an ETL that emits no descriptions, or no ontology
+    links, writes exactly that. String and list operations reject the null dtype, so such a file used
+    to crash extraction while saying no more than a ``String`` column of nulls says.
+
+    Only null-typed columns are cast, because only there can a cast not change a value. Any other
+    dtype is read as written, so a malformed column still fails loudly. Absent columns stay absent,
+    and ``layout.code_metadata_columns`` still reports the dtypes as written.
+
+    Args:
+        fp: The code metadata file.
+
+    Returns:
+        A lazy frame over the file.
+
+    Examples:
+        >>> spec = {"metadata": {"codes.parquet": pa.table({
+        ...     "code": pa.array(["HR", "GLU"]),
+        ...     "description": pa.array([None, None], pa.null()),
+        ...     "parent_codes": pa.array([None, [None]], pa.list_(pa.null())),
+        ... })}}
+        >>> with yaml_disk(spec) as d:
+        ...     fp = d / "metadata" / "codes.parquet"
+        ...     dict(pl.scan_parquet(fp).collect_schema())
+        ...     _scan_code_metadata(fp).collect().to_dict(as_series=False)
+        {'code': String, 'description': Null, 'parent_codes': List(Null)}
+        {'code': ['HR', 'GLU'], 'description': [None, None], 'parent_codes': [None, [None]]}
+        >>> with yaml_disk(spec) as d:
+        ...     dict(_scan_code_metadata(d / "metadata" / "codes.parquet").collect_schema())
+        {'code': String, 'description': String, 'parent_codes': List(String)}
+
+        Columns that are already typed, or absent, are left alone:
+
+        >>> with yaml_disk({"metadata": {"codes.parquet": {"code": ["HR"]}}}) as d:
+        ...     dict(_scan_code_metadata(d / "metadata" / "codes.parquet").collect_schema())
+        {'code': String}
+    """
+    lf = pl.scan_parquet(fp)
+    schema = lf.collect_schema()
+    null_typed = [name for name in _CODE_METADATA_DTYPES if schema.get(name) in (pl.Null, pl.List(pl.Null))]
+    return lf.with_columns(pl.col(name).cast(_CODE_METADATA_DTYPES[name]) for name in null_typed)
+
+
 def _code_vocabulary_map(meds_dir: Path) -> pl.LazyFrame | None:
     """Build the distinct ``(code, vocabulary)`` mapping implied by ``parent_codes``.
 
@@ -721,12 +774,11 @@ def _code_vocabulary_map(meds_dir: Path) -> pl.LazyFrame | None:
     fp = meds_dir / meds.code_metadata_filepath
     if not fp.is_file():
         return None
-    schema = pl.scan_parquet(fp).collect_schema()
-    if "parent_codes" not in schema:
+    lf = _scan_code_metadata(fp)
+    if "parent_codes" not in lf.collect_schema():
         return None
     return (
-        pl.scan_parquet(fp)
-        .select("code", "parent_codes")
+        lf.select("code", "parent_codes")
         .explode("parent_codes", empty_as_null=True)
         .drop_nulls("parent_codes")
         .rename({"parent_codes": "parent_code"})
@@ -1109,7 +1161,7 @@ def _ontology_block(
     fp = meds_dir / meds.code_metadata_filepath
     if not fp.is_file():
         return {"present": False}
-    lf = pl.scan_parquet(fp)
+    lf = _scan_code_metadata(fp)
     if "parent_codes" not in lf.collect_schema():
         return {"present": False}
 
@@ -1237,7 +1289,7 @@ def _code_metadata_block(
     if not fp.is_file():
         return {"present": False}
 
-    lf = pl.scan_parquet(fp)
+    lf = _scan_code_metadata(fp)
     schema = lf.collect_schema()
     metadata_codes = lf.select("code").collect()["code"]
     observed_codes = set(per_code["code"].to_list())
