@@ -138,8 +138,22 @@ def _distribution(series: pl.Series, cfg: ExtractConfig) -> dict[str, Any]:
 
         >>> _distribution(pl.Series([None, None], dtype=pl.Float64), cfg)
         {'n': 0, 'suppressed': True}
+
+        The summary depends only on the values, not on their order or on how they are laid out in
+        memory. Floating-point sums do depend on both. Without sorting, the standard deviation of a
+        hundred copies of 4/3, which is zero in exact arithmetic, comes out as 4e-16 or 7e-16
+        depending on how the series is split:
+
+        >>> same = [4 / 3] * 100
+        >>> split = pl.concat([pl.Series(same[:37]), pl.Series(same[37:])], rechunk=False)
+        >>> _distribution(pl.Series(same), cfg) == _distribution(split, cfg)
+        True
     """
-    n = series.len() - series.null_count()
+    # The per-subject and per-code frames come out of group-bys and chunk concatenation in no fixed
+    # order. Sorting first means the same values always give the same document, which the
+    # comparison relies on.
+    series = series.drop_nulls().sort()
+    n = series.len()
     if n < cfg.min_numeric_cell_size:
         return {"n": n, "suppressed": True}
     return {
@@ -228,6 +242,35 @@ def _finite_numeric() -> pl.Expr:
     """
     nv = pl.col("numeric_value")
     return pl.when(nv.is_not_null() & nv.is_finite()).then(nv).otherwise(None)
+
+
+#: Microseconds in a day. MEDS ``time`` is microsecond-resolution, so spans in days are exact.
+_MICROSECONDS_PER_DAY = 86_400 * 1_000_000
+
+
+def _observed() -> pl.Expr:
+    """Whether a row counts toward a subject's measurement rate.
+
+    A row counts when it has a ``time`` and its ``code`` is neither of the life events MEDS
+    defines, ``meds.birth_code`` and ``meds.death_code``. Static rows have no time, so they cannot
+    fall inside a span. Birth is usually decades before the record starts. A death recorded from a
+    registry can come long after the last encounter. Either would stretch the span over years with
+    no care in them.
+
+    The comparison is against the MEDS standard's own constants, never against the structure of a
+    code string. A row with a null code is still a measurement, so it counts.
+
+    Examples:
+        >>> df = pl.DataFrame(
+        ...     {"time": [None, datetime(1980, 1, 1), datetime(2020, 1, 1), datetime(2020, 1, 2),
+        ...               datetime(2024, 1, 1)],
+        ...      "code": ["EYE_COLOR//BLUE", "MEDS_BIRTH", "HR", None, "MEDS_DEATH"]},
+        ...     schema_overrides={"time": pl.Datetime("us")})
+        >>> df.select(_observed())["observed"].to_list()
+        [False, False, True, True, False]
+    """
+    life_event = pl.col("code").is_in([meds.birth_code, meds.death_code]).fill_null(False)
+    return (pl.col("time").is_not_null() & ~life_event).alias("observed")
 
 
 def _suppress_keyed(
@@ -977,6 +1020,8 @@ def _chunk_aggregates(base: pl.LazyFrame, vocab: pl.DataFrame | None) -> dict[st
     """
     nv = pl.col("numeric_value")
     finite = _finite_numeric()
+    observed = _observed()
+    observed_time = pl.when(observed).then(pl.col("time"))
 
     queries: dict[str, pl.LazyFrame] = {
         "overall": base.select(
@@ -1005,6 +1050,10 @@ def _chunk_aggregates(base: pl.LazyFrame, vocab: pl.DataFrame | None) -> dict[st
             t_max=pl.col("time").max(),
             has_birth=(pl.col("code") == meds.birth_code).any(),
             has_death=(pl.col("code") == meds.death_code).any(),
+            # The inputs to `per_subject.measurements_per_day`; see `_measurements_per_day`.
+            n_observed=observed.sum(),
+            t_observed_min=observed_time.min(),
+            t_observed_max=observed_time.max(),
         ),
         "per_code": base.group_by("code").agg(
             n_measurements=pl.len(),
@@ -1790,6 +1839,52 @@ def _counts_block(overall: pl.DataFrame, per_subject: pl.DataFrame) -> dict[str,
     }
 
 
+def _measurements_per_day(per_subject: pl.DataFrame) -> pl.Series:
+    """Each subject's measurement rate, or null where it is undefined.
+
+    The rate is ``n_observed`` divided by the time from ``t_observed_min`` to ``t_observed_max``,
+    in days. All three are computed over the same rows, those selected by :func:`_observed`, so
+    every row counted falls inside the span. The rate is computed per subject and only then
+    summarized, so its quantiles describe subjects. A ratio of the mean count to the mean span
+    would not.
+
+    A subject whose span is zero has no rate: one distinct timestamp, or none at all. Such subjects
+    are null here, so :func:`_distribution` leaves them out and its ``n`` counts only the subjects
+    that have a rate. They are not given an infinite or zero rate.
+
+    Args:
+        per_subject: The per-subject aggregate, with ``n_observed``, ``t_observed_min``, and
+            ``t_observed_max``.
+
+    Returns:
+        A ``Float64`` series aligned with ``per_subject``, in measurements per day.
+
+    Examples:
+        Ten rows over four days, then three rows over twelve hours. A third subject's rows all
+        share one timestamp, and a fourth has no timestamped rows that count:
+
+        >>> per_subject = pl.DataFrame({
+        ...     "n_observed": [10, 3, 4, 0],
+        ...     "t_observed_min": [datetime(2020, 1, 1), datetime(2020, 1, 1), datetime(2020, 1, 1), None],
+        ...     "t_observed_max": [datetime(2020, 1, 5), datetime(2020, 1, 1, 12), datetime(2020, 1, 1),
+        ...                        None],
+        ... })
+        >>> _measurements_per_day(per_subject).to_list()
+        [2.5, 6.0, None, None]
+
+        The span is exact to the microsecond, so even a very short one gives a finite rate:
+
+        >>> one_second = pl.DataFrame({"n_observed": [2], "t_observed_min": [datetime(2020, 1, 1)],
+        ...                            "t_observed_max": [datetime(2020, 1, 1, 0, 0, 1)]})
+        >>> _measurements_per_day(one_second).to_list()
+        [172800.0]
+    """
+    span = pl.col("t_observed_max") - pl.col("t_observed_min")
+    days = span.dt.total_microseconds().cast(pl.Float64) / _MICROSECONDS_PER_DAY
+    rate = pl.when(days > 0).then(pl.col("n_observed").cast(pl.Float64) / days)
+    return per_subject.select(rate.alias("measurements_per_day")).to_series()
+
+
 def _per_subject_block(per_subject: pl.DataFrame, cfg: ExtractConfig) -> dict[str, Any]:
     """Summarize the per-subject distributions.
 
@@ -1802,14 +1897,31 @@ def _per_subject_block(per_subject: pl.DataFrame, cfg: ExtractConfig) -> dict[st
         ...     "n_measurements": [10, 20], "n_events": [2, 4], "n_unique_codes": [3, 5],
         ...     "t_min": [datetime(2020, 1, 1), datetime(2021, 1, 1)],
         ...     "t_max": [datetime(2020, 1, 11), datetime(2021, 1, 3)],
+        ...     "n_observed": [9, 19],
+        ...     "t_observed_min": [datetime(2020, 1, 2), datetime(2021, 1, 1)],
+        ...     "t_observed_max": [datetime(2020, 1, 5), datetime(2021, 1, 3)],
         ... })
         >>> block = _per_subject_block(per_subject, cfg)
         >>> sorted(block)
-        ['n_events', 'n_measurements', 'n_unique_codes', 'span_days']
+        ['measurements_per_day', 'n_events', 'n_measurements', 'n_unique_codes', 'span_days']
         >>> block["n_measurements"]
         {'n': 2, 'mean': 15.0, 'std': 7.07107, 'quantiles': {'p50': 15.0}}
         >>> block["span_days"]["mean"]
         6.0
+
+        The rate is computed per subject and then averaged: (9 / 3 + 19 / 2) / 2 = 6.25. A ratio
+        of the averages, 15 / 6 = 2.5, describes neither subject:
+
+        >>> block["measurements_per_day"]
+        {'n': 2, 'mean': 6.25, 'std': 4.59619, 'quantiles': {'p50': 6.25}}
+
+        A subject with no rate is left out of the distribution's ``n``. Here that leaves one
+        subject, below the floor of two, so only the count is reported:
+
+        >>> one_timestamp = per_subject.with_columns(t_observed_max=pl.col("t_observed_min"))
+        >>> _per_subject_block(one_timestamp.head(1).vstack(per_subject.tail(1)), cfg)[
+        ...     "measurements_per_day"]
+        {'n': 1, 'suppressed': True}
     """
     span_days = (per_subject["t_max"] - per_subject["t_min"]).dt.total_seconds().cast(pl.Float64) / 86400.0
     return {
@@ -1817,6 +1929,7 @@ def _per_subject_block(per_subject: pl.DataFrame, cfg: ExtractConfig) -> dict[st
         "n_events": _distribution(per_subject["n_events"].cast(pl.Float64), cfg),
         "n_unique_codes": _distribution(per_subject["n_unique_codes"].cast(pl.Float64), cfg),
         "span_days": _distribution(span_days, cfg),
+        "measurements_per_day": _distribution(_measurements_per_day(per_subject), cfg),
     }
 
 

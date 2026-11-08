@@ -9,17 +9,21 @@ Three families:
 2. **Digest and comparison algebra.** Determinism, order sensitivity, tie-breaking, and the
     threshold semantics that the tolerance policy relies on.
 3. **Cross-implementation agreement.** The scalar and vectorized parsers of ``parent_codes`` must
-    agree everywhere, since they are separate code paths for the same rule.
+    agree everywhere, since they are separate code paths for the same rule. Likewise, the
+    per-subject measurement rate must agree with a row-by-row reading of its definition.
 """
 
 from __future__ import annotations
 
 import itertools
 import json
+import math
 import string
-from datetime import datetime
+from collections import defaultdict
+from datetime import datetime, timedelta
 
 import hypothesis.strategies as st
+import meds
 import polars as pl
 import pytest
 from hypothesis import HealthCheck, assume, given, settings
@@ -243,6 +247,89 @@ class TestPrivacyInvariants:
         first.pop("extracted_at")
         second.pop("extracted_at")
         assert first == second
+
+
+@st.composite
+def meds_datasets_with_life_events(draw):
+    """A generated dataset in which each subject may also carry a birth and a death row.
+
+    ``meds_datasets`` never draws the MEDS life-event codes, and they are what
+    ``per_subject.measurements_per_day`` treats specially, so they are added here at arbitrary times,
+    including none at all and times far outside the subject's other rows.
+    """
+    rows, code_rows, n_shards = draw(meds_datasets())
+    moments = st.one_of(st.none(), st.datetimes(datetime(1900, 1, 1), datetime(2030, 12, 31)))
+    for subject_id in sorted({r["subject_id"] for r in rows}):
+        for code in (meds.birth_code, meds.death_code):
+            if draw(st.booleans()):
+                rows.append(
+                    {"subject_id": subject_id, "time": draw(moments), "code": code, "numeric_value": None}
+                )
+    return rows, code_rows, n_shards
+
+
+def _reference_measurements_per_day(rows: list[dict]) -> list[float]:
+    """Each subject's measurement rate, computed row by row from the documented definition.
+
+    The rows that count are the timestamped ones whose code is neither MEDS life event. The rate is their
+    number divided by the time from the earliest to the latest, in days, and a subject with no such span has
+    no rate.
+    """
+    times = defaultdict(list)
+    for row in rows:
+        if row["time"] is not None and row["code"] not in (meds.birth_code, meds.death_code):
+            times[row["subject_id"]].append(row["time"])
+    rates = []
+    for subject_times in times.values():
+        span_days = (max(subject_times) - min(subject_times)) / timedelta(days=1)
+        if span_days > 0:
+            rates.append(len(subject_times) / span_days)
+    return rates
+
+
+class TestMeasurementsPerDay:
+    """``per_subject.measurements_per_day`` must be exactly the distribution its definition describes."""
+
+    @settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @given(dataset=meds_datasets_with_life_events(), max_rows=st.one_of(st.none(), st.integers(1, 60)))
+    def test_the_rate_matches_a_row_by_row_reference(self, dataset, max_rows, tmp_path_factory):
+        rows, code_rows, n_shards = dataset
+        root = _write(tmp_path_factory.mktemp("meds"), rows, code_rows, n_shards)
+        cfg = ExtractConfig(min_cell_size=1, min_numeric_cell_size=1)
+        block = extract_summary_stats(root, cfg, max_rows_per_chunk=max_rows)["per_subject"][
+            "measurements_per_day"
+        ]
+
+        expected = pl.Series(_reference_measurements_per_day(rows), dtype=pl.Float64)
+        # Subjects without a span are left out of `n` rather than given an infinite or zero rate.
+        assert block["n"] == expected.len()
+        if expected.is_empty():
+            assert block == {"n": 0, "suppressed": True}
+            return
+
+        assert all(math.isfinite(v) and v > 0 for v in block["quantiles"].values()), block
+        # Emitted values carry six significant digits; the absolute floor covers a std that is zero
+        # in exact arithmetic but not in floating point.
+        tol = {"rel": 1e-5, "abs": 1e-9 * float(expected.abs().max())}
+        assert block["mean"] == pytest.approx(expected.mean(), **tol)
+        if expected.len() > 1:
+            assert block["std"] == pytest.approx(expected.std(), **tol)
+        for q in cfg.quantiles:
+            key = f"p{q * 100:g}".replace(".", "_")
+            assert block["quantiles"][key] == pytest.approx(expected.quantile(q, "linear"), **tol)
+
+    @settings(max_examples=25, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @given(dataset=meds_datasets_with_life_events(), floor=st.integers(2, 30))
+    def test_quantiles_never_describe_fewer_subjects_than_the_floor(self, dataset, floor, tmp_path_factory):
+        rows, code_rows, n_shards = dataset
+        root = _write(tmp_path_factory.mktemp("meds"), rows, code_rows, n_shards)
+        block = extract_summary_stats(root, ExtractConfig(min_numeric_cell_size=floor))["per_subject"][
+            "measurements_per_day"
+        ]
+        if block["n"] < floor:
+            assert block == {"n": block["n"], "suppressed": True}
+        else:
+            assert set(block) == {"n", "mean", "std", "quantiles"}
 
 
 class TestChunkedAggregation:

@@ -68,7 +68,7 @@ extract_MEDS_summary_stats examples/datasets/v1_baseline -o examples/stats/v1_ba
 ```
 
 That fingerprint is committed at [`examples/stats/v1_baseline.json`](examples/stats/v1_baseline.json)
-— 8 KB of JSON, safe to keep in version control next to the ETL that produced it. The headline
+— 10 KB of JSON, safe to keep in version control next to the ETL that produced it. The headline
 block:
 
 ```python
@@ -149,7 +149,7 @@ Re-extracting the same dataset reproduces it exactly, which is the property the 
 >>> from meds_summary_stats.compare import compare_summary_stats
 >>> from meds_summary_stats.report import render_text
 >>> print(render_text(compare_summary_stats(baseline, baseline)))
-PASS - 199 paths checked, 4 ignored, no findings.
+PASS - 209 paths checked, 4 ignored, no findings.
 
 ```
 
@@ -169,7 +169,7 @@ compare_MEDS_summary_stats examples/stats/v1_baseline.json current.json # exit 1
 >>> regressed = read_summary_stats(EXAMPLES / "stats" / "v1_etl_regression.json")
 >>> report = compare_summary_stats(baseline, regressed)
 >>> report.status, report.failed, report.counts
-('fail', True, {'error': 44, 'info': 0, 'warning': 22})
+('fail', True, {'error': 48, 'info': 0, 'warning': 24})
 
 ```
 
@@ -230,11 +230,11 @@ compare_MEDS_summary_stats examples/stats/v1_baseline.json current.json \
 >>> policy = ComparePolicy.from_dict({"on_dataset_version_change": "relax"})
 >>> relaxed = compare_summary_stats(baseline, refreshed, policy)
 >>> relaxed.status, relaxed.failed, relaxed.counts
-('warn', False, {'error': 0, 'info': 60, 'warning': 11})
+('warn', False, {'error': 0, 'info': 65, 'warning': 11})
 
 ```
 
-The 60 volume findings drop to informational. What survives as a warning is the *ordering* of the
+The 65 volume findings drop to informational. What survives as a warning is the *ordering* of the
 vocabulary by frequency, which genuinely did shift as the cohort grew, plus the file checksums,
 which are of course different files:
 
@@ -277,7 +277,7 @@ A single canonical JSON document. Roughly:
 | `counts`        | subjects, measurements, events, unique codes, static rows, births, deaths, global numeric moments, data-quality invariants |
 | `codes`         | vocabulary digests, occurrence distributions, concentration curves                                                         |
 | `code_metadata` | metadata coverage, plus per-external-vocabulary statistics and mapping coverage from `parent_codes`                        |
-| `per_subject`   | distributions of measurements, events, distinct codes, and record span per subject                                         |
+| `per_subject`   | distributions of measurements, events, distinct codes, record span, and measurements per day per subject                   |
 | `time`          | calendar-year histogram, optional time quantiles                                                                           |
 | `splits`        | per-split subject and measurement counts, plus data/split membership mismatches                                            |
 | `layout`        | shard count, column names and dtypes, per-shard presence, dtype conflicts                                                  |
