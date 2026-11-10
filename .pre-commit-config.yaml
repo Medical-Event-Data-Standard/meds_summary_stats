@@ -128,7 +128,7 @@ repos:
           # shfmt-py bundles the `shfmt` binary that mdformat-shfmt invokes.
           # Pinning here (and mirroring in pyproject.toml dev deps) keeps the
           # binary version stable across machines.
-          - shfmt-py==3.12.0.2
+          - shfmt-py==4.2.0
 
   # word spelling linter
   - repo: https://github.com/codespell-project/codespell
