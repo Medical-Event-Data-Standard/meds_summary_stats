@@ -34,7 +34,11 @@ Three rules, enforced structurally rather than by convention:
 3. **No extremes.** There is no `min` or `max` anywhere in the document — not on `numeric_value`,
     not on `time`. The subject with the longest record or the most extreme lab value is precisely
     where re-identification starts; quantiles replace them, and quantiles are themselves suppressed
-    below `min_numeric_cell_size` observations.
+    below `min_numeric_cell_size` observations. A quantile is also withheld whenever it would
+    depend on the smallest or largest value: near the tail of a small sample, linear interpolation
+    mixes in the extreme itself, and two such quantiles give it back exactly. So `p5` and `p95`
+    need 21 observations, `p1` and `p99` need 101, and smaller samples report only the quantiles
+    further in.
 
 ```python
 >>> import json
@@ -361,12 +365,15 @@ thousand-shard dataset does not produce a thousand-line document.
 
 ```python
 >>> stats["per_subject"]["n_measurements"]
-{'n': 6, 'mean': 10.3333, 'std': 4.13118, 'quantiles': {'p1': 7.0, 'p5': 7.0, 'p25': 7.0,
- 'p50': 9.0, 'p75': 12.5, 'p95': 16.0, 'p99': 16.8}}
+{'n': 6, 'mean': 10.3333, 'std': 4.13118, 'quantiles': {'p25': 7.0, 'p50': 9.0, 'p75': 12.5}}
 >>> sorted(stats["per_subject"])
 ['measurements_per_day', 'n_events', 'n_measurements', 'n_unique_codes', 'span_days']
 
 ```
+
+Six subjects are too few for the tails, so only the quartiles and the median are reported: every
+other quantile would depend on the smallest or largest value (see
+[the privacy contract](#the-privacy-contract)).
 
 `span_days` runs from a subject's first timestamped row to their last, whatever the code, so it
 includes the birth row and is usually decades long.
@@ -404,8 +411,8 @@ On the fixture, the birth row alone stretches `span_days` to about 29 years:
 >>> stats["per_subject"]["span_days"]["mean"]
 10492.4
 >>> stats["per_subject"]["measurements_per_day"]
-{'n': 6, 'mean': 108.798, 'std': 70.658, 'quantiles': {'p1': 41.348, 'p5': 43.2586,
- 'p25': 59.3581, 'p50': 95.5405, 'p75': 128.632, 'p95': 209.54, 'p99': 229.008}}
+{'n': 6, 'mean': 108.798, 'std': 70.658, 'quantiles': {'p25': 59.3581, 'p50': 95.5405,
+ 'p75': 128.632}}
 
 ```
 
@@ -432,7 +439,7 @@ A small worked example, where the values can be checked by hand:
 >>> with yaml_disk(spec) as d:
 ...     per_subject = extract_summary_stats(d, small)["per_subject"]
 >>> per_subject["measurements_per_day"]
-{'n': 2, 'mean': 8.75, 'std': 10.253, 'quantiles': {'p50': 8.75}}
+{'n': 2, 'mean': 8.75, 'std': 10.253, 'quantiles': {}}
 
 ```
 
@@ -441,6 +448,10 @@ A small worked example, where the values can be checked by hand:
 - Subject 2 has four rows left over six hours: 4 / 0.25 days = 16.
 - Subject 3 has two rows, both at the same timestamp, so their span is zero and they have no rate.
 - Subject 4 has only a static row and a birth, so no rows are left and they have no rate.
+
+The mean of the two rates, (1.5 + 16) / 2 = 8.75, checks the arithmetic. The median is not
+reported: of two rates it would be their midpoint, which depends on both extreme values, so it is
+withheld like every other quantile that would.
 
 All four count toward `n_measurements`, but only two have a rate:
 
@@ -487,7 +498,7 @@ comparison does not fail. Here the older baseline is simulated by removing the f
 >>> del older["per_subject"]["measurements_per_day"]
 >>> report = compare_summary_stats(older, stats)
 >>> report.status, report.failed, {f.kind for f in report.findings}, len(report.findings)
-('warn', False, {'added'}, 10)
+('warn', False, {'added'}, 6)
 
 ```
 

@@ -60,6 +60,8 @@ Three invariants hold everywhere in `extract.py`, and each is covered by a hypot
 2. **No keyed cell below `min_cell_size` distinct subjects.** Route new keyed blocks through
     `_suppress_keyed` rather than filtering by hand.
 3. **No `min` or `max`, anywhere.** Use quantiles. This is not negotiable for a new statistic.
+    Choose which quantiles to emit with `_reportable_quantiles`: near the tail of a small sample,
+    linear interpolation mixes in the extreme itself, so a hand-rolled quantile can leak the `max`.
 
 Parent codes from `metadata/codes.parquet` are the one exception: they name published external
 terminologies, so vocabulary names are safe to emit. Their *statistics* are still suppressed.

@@ -35,7 +35,9 @@ from meds_summary_stats.digests import digest, format_moment, ordered_by
 from meds_summary_stats.extract import (
     _aggregate,
     _code_vocabulary_map,
+    _distribution,
     _plan_chunks,
+    _qkey,
     _shard_paths,
     extract_summary_stats,
 )
@@ -56,6 +58,10 @@ codes = st.one_of(
 )
 
 parent_codes = st.text(string.ascii_letters + string.digits + "/_-.", min_size=0, max_size=20)
+
+# Quantile levels for the extremes property: the defaults plus the deeper tails a user might
+# configure, which need even more observations before they stop touching the extremes.
+_QUANTILE_CHOICES = (0.001, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 0.999)
 
 
 @st.composite
@@ -224,6 +230,85 @@ class TestPrivacyInvariants:
                     continue
                 assert entry["n_subjects"] >= floor, (key, entry, floor)
 
+    @settings(max_examples=300, deadline=None)
+    @given(
+        values=st.lists(
+            st.floats(-1e6, 1e6, allow_nan=False, allow_infinity=False), min_size=1, max_size=150
+        ),
+        floor=st.integers(1, 30),
+        quantiles=st.lists(st.sampled_from(_QUANTILE_CHOICES), min_size=1, max_size=7, unique=True),
+        up=st.floats(1, 1e6),
+        down=st.floats(1, 1e6),
+    )
+    def test_no_quantile_depends_on_the_smallest_or_largest_value(self, values, floor, quantiles, up, down):
+        """Invariant 3, stated as what it protects: the extremes cannot be read back out.
+
+        Checking for keys named ``min`` and ``max`` is not enough. With linear interpolation, a
+        quantile near the tail of a small sample is a weighted mix of the two most extreme values,
+        and two such quantiles in the same interval pin both values down exactly -- at ``n = 20``,
+        ``p95`` and ``p99`` give back the maximum to six significant digits.
+
+        So the property is stated directly: making the largest value larger and the smallest value
+        smaller must leave every emitted quantile unchanged. The converse is checked too, so the
+        guarantee cannot be bought by withholding quantiles that were safe to report: each one
+        withheld really would have moved.
+        """
+        cfg = ExtractConfig(min_numeric_cell_size=floor, quantiles=tuple(quantiles))
+        ordered = sorted(values)
+        raised, lowered = list(ordered), list(ordered)
+        raised[-1] += up
+        lowered[0] -= down
+        both = list(raised)
+        if len(both) > 1:
+            both[0] -= down
+
+        before = _distribution(pl.Series(ordered), cfg)
+        if len(ordered) < floor:
+            assert before == {"n": len(ordered), "suppressed": True}
+            return
+
+        after = _distribution(pl.Series(both), cfg)
+        assert before["quantiles"] == after["quantiles"], (before, after)
+
+        for q in cfg.quantiles:
+            if _qkey(q) in before["quantiles"]:
+                continue
+            raw = pl.Series(ordered).quantile(q, "linear")
+            moved = {pl.Series(raised).quantile(q, "linear"), pl.Series(lowered).quantile(q, "linear")}
+            assert moved != {raw}, f"{_qkey(q)} withheld at n={len(ordered)} but touches neither extreme"
+
+    @settings(max_examples=15, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @given(dataset=meds_datasets(), up=st.floats(1, 1e5), days=st.integers(1, 3650))
+    def test_full_column_quantiles_never_depend_on_the_extremes(self, dataset, up, days, tmp_path_factory):
+        """The same guarantee for ``numeric_detail: quantiles``, which takes a separate code path.
+
+        Full-column quantiles over ``numeric_value`` and ``time`` are computed over the whole
+        dataset rather than by :func:`_distribution`, so they need their own check. Moving the
+        largest and smallest finite value, and the latest and earliest timestamp, must change no
+        emitted quantile.
+        """
+        rows, code_rows, n_shards = dataset
+        cfg = ExtractConfig(min_cell_size=1, min_numeric_cell_size=1, numeric_detail="quantiles")
+        moved = [dict(r) for r in rows]
+        for field, shift in (("numeric_value", up), ("time", timedelta(days=days))):
+            present = [i for i, r in enumerate(moved) if r[field] is not None]
+            if not present:
+                continue
+            hi = max(present, key=lambda i: moved[i][field])
+            lo = min(present, key=lambda i: moved[i][field])
+            moved[hi][field] += shift
+            if lo != hi:
+                moved[lo][field] -= shift
+
+        before = extract_summary_stats(
+            _write(tmp_path_factory.mktemp("meds"), rows, code_rows, n_shards), cfg
+        )
+        after = extract_summary_stats(
+            _write(tmp_path_factory.mktemp("meds"), moved, code_rows, n_shards), cfg
+        )
+        assert before["counts"]["numeric"]["quantiles"] == after["counts"]["numeric"]["quantiles"]
+        assert before["time"]["quantiles"] == after["time"]["quantiles"]
+
     @settings(max_examples=15, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
     @given(dataset=meds_datasets())
     def test_a_document_always_compares_equal_to_itself(self, dataset, tmp_path_factory):
@@ -314,9 +399,12 @@ class TestMeasurementsPerDay:
         assert block["mean"] == pytest.approx(expected.mean(), **tol)
         if expected.len() > 1:
             assert block["std"] == pytest.approx(expected.std(), **tol)
-        for q in cfg.quantiles:
-            key = f"p{q * 100:g}".replace(".", "_")
-            assert block["quantiles"][key] == pytest.approx(expected.quantile(q, "linear"), **tol)
+        # Quantiles that would touch a subject's extreme value are withheld (see
+        # `test_no_quantile_depends_on_the_smallest_or_largest_value`); every one that is emitted
+        # must match the reference.
+        level = {_qkey(q): q for q in cfg.quantiles}
+        for key, value in block["quantiles"].items():
+            assert value == pytest.approx(expected.quantile(level[key], "linear"), **tol)
 
     @settings(max_examples=25, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
     @given(dataset=meds_datasets_with_life_events(), floor=st.integers(2, 30))
