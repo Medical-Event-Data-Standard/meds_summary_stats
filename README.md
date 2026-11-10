@@ -319,12 +319,12 @@ silently stops resolving, every count over the data is unchanged and only
 Both documents flatten to `path -> value`. Each path resolves to exactly one rule — the most
 specific glob that matches it — and the rule says how to compare:
 
-| kind       | behavior                                                          |
-| ---------- | ----------------------------------------------------------------- |
-| `exact`    | any inequality is a finding (schema, dtypes, digests)             |
-| `relative` | flag when `abs(new - old) / max(abs(old), 1)` exceeds a threshold |
-| `absolute` | flag when the raw delta exceeds a threshold                       |
-| `ignore`   | never compared (timestamps, tool version)                         |
+| kind       | behavior                                                             |
+| ---------- | -------------------------------------------------------------------- |
+| `exact`    | any inequality is a finding (schema, dtypes, digests)                |
+| `relative` | flag when `abs(new - old) / max(abs(old), 1)` exceeds a threshold    |
+| `absolute` | flag when the raw delta exceeds a threshold (in days for timestamps) |
+| `ignore`   | never compared (extraction time, tool version)                       |
 
 Each rule has a `warn` and an `error` tier. The built-in policy is already a reasonable ETL
 regression policy; a config file only states your overrides:

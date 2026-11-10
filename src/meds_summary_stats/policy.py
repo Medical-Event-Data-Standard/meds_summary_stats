@@ -108,7 +108,8 @@ class Kind(enum.StrEnum):
     Attributes:
         EXACT: Any inequality is a finding. For schema, dtypes, names, and digests.
         RELATIVE: Flag when ``|new - old| / max(|old|, 1)`` exceeds a threshold.
-        ABSOLUTE: Flag when ``|new - old|`` exceeds a threshold.
+        ABSOLUTE: Flag when ``|new - old|`` exceeds a threshold. For timestamps, such as
+            ``time.quantiles.*``, the difference is measured in days.
         IGNORE: Never compared.
     """
 
@@ -309,6 +310,10 @@ DEFAULT_RULES: tuple[dict[str, Any], ...] = (
     {"path": "counts.quality.**", "kind": "absolute", "warn": 0, "error": 0},
     # Distributions drift more freely than counts do.
     {"path": "**.quantiles.*", "kind": "relative", "warn": 0.005, "error": 0.02},
+    # Timestamp quantiles, in days: a relative threshold on a timestamp would be relative to the
+    # epoch. The same data gives identical timestamps, so any movement warns -- a sub-day shift is
+    # what a timezone regression looks like -- and a move of more than a day is an error.
+    {"path": "time.quantiles.*", "kind": "absolute", "warn": 0.0, "error": 1.0},
     {"path": "**.mean", "kind": "relative", "warn": 0.005, "error": 0.02},
     {"path": "**.std", "kind": "relative", "warn": 0.01, "error": 0.05},
     # Vocabulary. A changed set of codes is an error; a changed *ordering* of codes is a warning,

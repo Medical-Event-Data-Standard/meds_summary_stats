@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import math
+import re
 from typing import Any
 
 from .extract import STATS_SCHEMA_VERSION
@@ -13,6 +15,11 @@ from .policy import ComparePolicy, DatasetVersionChangeAction, Kind, Rule, Sever
 #: Paths that describe the extraction itself rather than the dataset, and so must agree exactly
 #: before any other comparison is meaningful.
 _CONFIG_PREFIX = "config."
+
+#: The exact shape extraction writes a timestamp in: ``datetime.isoformat()`` of a naive datetime.
+_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{6})?")
+
+_SECONDS_PER_DAY = 86_400
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
@@ -98,6 +105,30 @@ def _is_number(value: Any) -> bool:
         [True, True, False, False, False, True]
     """
     return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _timestamp(value: Any) -> datetime.datetime | None:
+    """Parse a timestamp written by extraction, or return ``None`` for anything else.
+
+    Deliberately narrower than :meth:`datetime.datetime.fromisoformat`, which also accepts dates,
+    week dates, and basic-format strings such as ``"20200101"``. Under that parser a version string
+    or a code count could be read as a date and silently compared as a span of days. Only the shape
+    extraction emits -- ``YYYY-MM-DDTHH:MM:SS`` with optional microseconds and no offset -- counts.
+
+    Examples:
+        >>> _timestamp("2021-12-19T19:17:48")
+        datetime.datetime(2021, 12, 19, 19, 17, 48)
+        >>> _timestamp("2021-12-19T19:17:48.500000")
+        datetime.datetime(2021, 12, 19, 19, 17, 48, 500000)
+        >>> [_timestamp(v) for v in ("20200101", "2020-01-01", "2020-13-01T00:00:00", 2020, None)]
+        [None, None, None, None, None]
+    """
+    if not isinstance(value, str) or not _TIMESTAMP.fullmatch(value):
+        return None
+    try:
+        return datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 def relative_delta(baseline: float, current: float) -> float:
@@ -318,12 +349,59 @@ def _compare_leaf(path: str, baseline: Any, current: Any, rule: Rule) -> Finding
         ...                   Rule(path="**", kind=Kind.EXACT))
         >>> f.kind, f.message
         ('set', "added 'a'")
+
+        Under an ``absolute`` rule, two timestamps compare as a distance in days, so the timestamp
+        quantiles get a tolerance like every other quantile. The default policy warns on any
+        movement and errors beyond one day:
+
+        >>> policy = ComparePolicy.default()
+        >>> rule = policy.rule_for("time.quantiles.p99")
+        >>> rule.path, rule.kind
+        ('time.quantiles.*', <Kind.ABSOLUTE: 'absolute'>)
+        >>> f = _compare_leaf("time.quantiles.p99", "2021-12-19T19:17:48", "2021-12-19T19:54:24", rule)
+        >>> f.severity, f.kind, f.threshold
+        (<Severity.WARNING: 'warning'>, 'absolute', 0.0)
+        >>> print(f.message)
+        2021-12-19T19:17:48 -> 2021-12-19T19:54:24 (+0.0254167 days), over absolute threshold 0.0 days
+        >>> f = _compare_leaf("time.quantiles.p50", "2019-07-30T17:01:00", "2019-08-05T12:50:00", rule)
+        >>> f.severity, round(f.delta, 4)
+        (<Severity.ERROR: 'error'>, 5.8257)
+        >>> _compare_leaf("time.quantiles.p50", "2019-07-30T17:01:00", "2019-07-30T17:01:00", rule) is None
+        True
+
+        Only the exact shape extraction writes counts as a timestamp. ``"20200101"`` is valid ISO
+        8601 too, but read as a date it would turn a version string into a span of days, so it falls
+        back to exact comparison like any other string:
+
+        >>> f = _compare_leaf("dataset.dataset_version", "20200101", "20200102",
+        ...                   Rule(path="**", kind=Kind.ABSOLUTE, error=1.0))
+        >>> f.kind, f.severity
+        ('exact', <Severity.ERROR: 'error'>)
     """
     if rule.kind is Kind.IGNORE:
         return None
 
     if isinstance(baseline, list) and isinstance(current, list):
         return _compare_collection(path, baseline, current, rule)
+
+    if rule.kind is Kind.ABSOLUTE and (before := _timestamp(baseline)) and (after := _timestamp(current)):
+        # A relative threshold on a timestamp would be relative to the Unix epoch, which means
+        # nothing; an absolute distance has a natural unit, and that unit is days.
+        delta = (after - before).total_seconds() / _SECONDS_PER_DAY
+        severity = _severity_for(rule, abs(delta))
+        if severity is None:
+            return None
+        threshold = rule.error if severity is Severity.ERROR else rule.warn
+        return Finding(
+            path=path,
+            severity=severity,
+            kind=str(rule.kind),
+            baseline=baseline,
+            current=current,
+            delta=delta,
+            threshold=threshold,
+            message=f"{baseline} -> {current} ({delta:+.6g} days), over absolute threshold {threshold} days",
+        )
 
     if rule.kind is Kind.EXACT or not (_is_number(baseline) and _is_number(current)):
         if baseline == current or (
