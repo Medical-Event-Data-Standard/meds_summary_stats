@@ -221,6 +221,24 @@ to the statistics as everywhere else — a vocabulary reached by too few subject
 `emit_ontology_keys: true` to list every key per vocabulary; that is off by default for output
 size, not for privacy.
 
+`keys_digest` is the check; `keys`, when emitted, is its explanation. A changed key is therefore one
+error, from the digest, which is there whether or not keys are listed, plus an `info` finding that
+names what was added and removed:
+
+```python
+>>> from meds_summary_stats.compare import compare_summary_stats
+>>> def loinc(keys, digest):
+...     return {"code_metadata": {"ontology": {"by_vocabulary": {"LOINC": {
+...         "keys": keys, "keys_digest": digest}}}}}
+>>> report = compare_summary_stats(loinc(["8867-4", "2345-7"], "sha256:a"),
+...                                loinc(["8867-4", "2339-0"], "sha256:b"))
+>>> for f in report.findings:
+...     print(f"{f.severity}: {f.path.rsplit('.', 1)[-1]} {f.message}")
+error: keys_digest changed from 'sha256:a' to 'sha256:b'
+info: keys added '2339-0'; removed '2345-7'
+
+```
+
 A code with parents in two vocabularies is counted under both, so `n_measurements` across
 vocabularies deliberately over-sums relative to the dataset total.
 

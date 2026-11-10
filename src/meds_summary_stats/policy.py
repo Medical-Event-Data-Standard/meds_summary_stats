@@ -341,6 +341,10 @@ DEFAULT_RULES: tuple[dict[str, Any], ...] = (
     {"path": "codes.digests.numeric_moments.n_codes", "kind": "relative", "warn": 0.0, "error": 0.05},
     {"path": "code_metadata.vocabulary_digest", "kind": "exact"},
     {"path": "code_metadata.ontology.by_vocabulary.*.keys_digest", "kind": "exact"},
+    # `keys` is only emitted under `emit_ontology_keys`, and then it explains a `keys_digest` change
+    # rather than being a second check of it. The digest carries the error in both modes; left to
+    # the catch-all, the same changed key would be reported as two errors.
+    {"path": "code_metadata.ontology.by_vocabulary.*.keys", "kind": "exact", "on_change": "info"},
     {"path": "code_metadata.ontology.by_vocabulary.*.recognized", "kind": "exact"},
     # Ontology coverage is the axis that says *where* the vocabulary moved, and a mapping table
     # that stops resolving shows up here and nowhere else.
