@@ -5,14 +5,16 @@ The output is a single JSON document whose every leaf is a scalar, so it flatten
 in it republishes the dataset's code vocabulary: codes are reported only through digests, aggregate
 distributions, and namespace/ontology rollups that are suppressed below a subject-count floor.
 
-The dataset is read in a small, fixed number of streaming passes regardless of its size; the only
-frames materialized in memory are per-subject and per-code, both of which are orders of magnitude
-smaller than the data itself.
+The data is aggregated in streaming passes over chunks of a bounded number of rows, which never split
+a subject and whose results combine exactly, so peak memory does not grow with the size of the
+dataset. The only frames materialized whole are per-subject and per-code, both of which are orders
+of magnitude smaller than the data itself.
 """
 
 from __future__ import annotations
 
 import datetime
+import itertools
 import json
 import math
 from pathlib import Path
@@ -37,6 +39,13 @@ _CONCENTRATION_LEVELS: tuple[float, ...] = (0.5, 0.9, 0.99)
 
 #: Vocabulary head sizes for which cumulative measurement share is reported.
 _TOP_K_LEVELS: tuple[int, ...] = (10, 100, 1000)
+
+#: Default row budget for one aggregation pass; see ``_plan_chunks``.
+#:
+#: Peak memory is bounded by the chunk rather than the dataset. Measured on a synthetic ICU-shaped
+#: cohort of 256M rows, this budget peaks under 2 GB resident and is as fast as any larger one;
+#: bigger chunks were measured both slower and hungrier.
+DEFAULT_MAX_ROWS_PER_CHUNK = 10_000_000
 
 _REQUIRED_DATA_COLUMNS = ("subject_id", "code")
 _CORE_DATA_COLUMNS = ("subject_id", "time", "code", "numeric_value")
@@ -129,8 +138,22 @@ def _distribution(series: pl.Series, cfg: ExtractConfig) -> dict[str, Any]:
 
         >>> _distribution(pl.Series([None, None], dtype=pl.Float64), cfg)
         {'n': 0, 'suppressed': True}
+
+        The summary depends only on the values, not on their order or on how they are laid out in
+        memory. Floating-point sums do depend on both. Without sorting, the standard deviation of a
+        hundred copies of 4/3, which is zero in exact arithmetic, comes out as 4e-16 or 7e-16
+        depending on how the series is split:
+
+        >>> same = [4 / 3] * 100
+        >>> split = pl.concat([pl.Series(same[:37]), pl.Series(same[37:])], rechunk=False)
+        >>> _distribution(pl.Series(same), cfg) == _distribution(split, cfg)
+        True
     """
-    n = series.len() - series.null_count()
+    # The per-subject and per-code frames come out of group-bys and chunk concatenation in no fixed
+    # order. Sorting first means the same values always give the same document, which the
+    # comparison relies on.
+    series = series.drop_nulls().sort()
+    n = series.len()
     if n < cfg.min_numeric_cell_size:
         return {"n": n, "suppressed": True}
     return {
@@ -219,6 +242,35 @@ def _finite_numeric() -> pl.Expr:
     """
     nv = pl.col("numeric_value")
     return pl.when(nv.is_not_null() & nv.is_finite()).then(nv).otherwise(None)
+
+
+#: Microseconds in a day. MEDS ``time`` is microsecond-resolution, so spans in days are exact.
+_MICROSECONDS_PER_DAY = 86_400 * 1_000_000
+
+
+def _observed() -> pl.Expr:
+    """Whether a row counts toward a subject's measurement rate.
+
+    A row counts when it has a ``time`` and its ``code`` is neither of the life events MEDS
+    defines, ``meds.birth_code`` and ``meds.death_code``. Static rows have no time, so they cannot
+    fall inside a span. Birth is usually decades before the record starts. A death recorded from a
+    registry can come long after the last encounter. Either would stretch the span over years with
+    no care in them.
+
+    The comparison is against the MEDS standard's own constants, never against the structure of a
+    code string. A row with a null code is still a measurement, so it counts.
+
+    Examples:
+        >>> df = pl.DataFrame(
+        ...     {"time": [None, datetime(1980, 1, 1), datetime(2020, 1, 1), datetime(2020, 1, 2),
+        ...               datetime(2024, 1, 1)],
+        ...      "code": ["EYE_COLOR//BLUE", "MEDS_BIRTH", "HR", None, "MEDS_DEATH"]},
+        ...     schema_overrides={"time": pl.Datetime("us")})
+        >>> df.select(_observed())["observed"].to_list()
+        [False, False, True, True, False]
+    """
+    life_event = pl.col("code").is_in([meds.birth_code, meds.death_code]).fill_null(False)
+    return (pl.col("time").is_not_null() & ~life_event).alias("observed")
 
 
 def _suppress_keyed(
@@ -679,6 +731,59 @@ def _base_frame(shards: list[Path], available: set[str]) -> pl.LazyFrame:
     return frames[0] if len(frames) == 1 else pl.concat(frames, how="vertical")
 
 
+#: The MEDS dtypes of the optional code-metadata columns read here, for typing ones written null.
+_CODE_METADATA_DTYPES: dict[str, pl.DataType] = {
+    "description": pl.String,
+    "parent_codes": pl.List(pl.String),
+}
+
+
+def _scan_code_metadata(fp: Path) -> pl.LazyFrame:
+    """Scan ``metadata/codes.parquet``, typing any column that was written with a null dtype.
+
+    A column holding nothing but nulls is often *written* null-typed: that is the dtype polars and
+    pyarrow infer for an all-``None`` column, so an ETL that emits no descriptions, or no ontology
+    links, writes exactly that. String and list operations reject the null dtype, so such a file used
+    to crash extraction while saying no more than a ``String`` column of nulls says.
+
+    Only null-typed columns are cast, because only there can a cast not change a value. Any other
+    dtype is read as written, so a malformed column still fails loudly. Absent columns stay absent,
+    and ``layout.code_metadata_columns`` still reports the dtypes as written.
+
+    Args:
+        fp: The code metadata file.
+
+    Returns:
+        A lazy frame over the file.
+
+    Examples:
+        >>> spec = {"metadata": {"codes.parquet": pa.table({
+        ...     "code": pa.array(["HR", "GLU"]),
+        ...     "description": pa.array([None, None], pa.null()),
+        ...     "parent_codes": pa.array([None, [None]], pa.list_(pa.null())),
+        ... })}}
+        >>> with yaml_disk(spec) as d:
+        ...     fp = d / "metadata" / "codes.parquet"
+        ...     dict(pl.scan_parquet(fp).collect_schema())
+        ...     _scan_code_metadata(fp).collect().to_dict(as_series=False)
+        {'code': String, 'description': Null, 'parent_codes': List(Null)}
+        {'code': ['HR', 'GLU'], 'description': [None, None], 'parent_codes': [None, [None]]}
+        >>> with yaml_disk(spec) as d:
+        ...     dict(_scan_code_metadata(d / "metadata" / "codes.parquet").collect_schema())
+        {'code': String, 'description': String, 'parent_codes': List(String)}
+
+        Columns that are already typed, or absent, are left alone:
+
+        >>> with yaml_disk({"metadata": {"codes.parquet": {"code": ["HR"]}}}) as d:
+        ...     dict(_scan_code_metadata(d / "metadata" / "codes.parquet").collect_schema())
+        {'code': String}
+    """
+    lf = pl.scan_parquet(fp)
+    schema = lf.collect_schema()
+    null_typed = [name for name in _CODE_METADATA_DTYPES if schema.get(name) in (pl.Null, pl.List(pl.Null))]
+    return lf.with_columns(pl.col(name).cast(_CODE_METADATA_DTYPES[name]) for name in null_typed)
+
+
 def _code_vocabulary_map(meds_dir: Path) -> pl.LazyFrame | None:
     """Build the distinct ``(code, vocabulary)`` mapping implied by ``parent_codes``.
 
@@ -721,12 +826,11 @@ def _code_vocabulary_map(meds_dir: Path) -> pl.LazyFrame | None:
     fp = meds_dir / meds.code_metadata_filepath
     if not fp.is_file():
         return None
-    schema = pl.scan_parquet(fp).collect_schema()
-    if "parent_codes" not in schema:
+    lf = _scan_code_metadata(fp)
+    if "parent_codes" not in lf.collect_schema():
         return None
     return (
-        pl.scan_parquet(fp)
-        .select("code", "parent_codes")
+        lf.select("code", "parent_codes")
         .explode("parent_codes", empty_as_null=True)
         .drop_nulls("parent_codes")
         .rename({"parent_codes": "parent_code"})
@@ -735,74 +839,189 @@ def _code_vocabulary_map(meds_dir: Path) -> pl.LazyFrame | None:
     )
 
 
-def _aggregate(
-    base: pl.LazyFrame, cfg: ExtractConfig, vocab_map: pl.LazyFrame | None
-) -> dict[str, pl.DataFrame]:
-    """Run every data-scanning aggregate in one batch.
+def _subject_filters(counts: pl.DataFrame, max_rows: int) -> list[pl.Expr]:
+    """Cut the subject-id axis into contiguous ranges of roughly ``max_rows`` rows each.
 
-    The queries are collected together so that polars can share the parquet scan and common subplans
-    across them: the dataset is read a small fixed number of times rather than once per statistic.
+    Every subject lands in exactly one range, which is what lets distinct-subject counts add across
+    them. The ranges are half-open and the outer two unbounded, so every possible id is covered
+    whether or not it appears in ``counts``. Null subject ids fall in no range and ride with the
+    first.
+
+    A new range starts at the first subject whose starting row offset crosses the next multiple of
+    ``max_rows``, so a range overshoots the budget by less than one subject -- the one unit that
+    cannot be split.
 
     Args:
-        base: The normalized four-column frame.
-        cfg: Extraction configuration.
-        vocab_map: Optional ``(code, vocabulary)`` mapping to attribute measurements to ontologies.
+        counts: Rows per subject, as columns ``subject_id`` and ``n``.
+        max_rows: The row budget per range.
+
+    Returns:
+        One filter expression per range.
+
+    Examples:
+        >>> frame = pl.DataFrame({"subject_id": [1, 2, 3, 4, 5, None, 9]})
+        >>> counts = pl.DataFrame({"subject_id": [1, 2, 3, 4, 5], "n": [4, 4, 4, 4, 4]})
+        >>> [frame.filter(f)["subject_id"].to_list() for f in _subject_filters(counts, 10)]
+        [[1, 2, 3, None], [4, 5, 9]]
+
+        A subject larger than the whole budget still stays whole:
+
+        >>> counts = pl.DataFrame({"subject_id": [1, 2, 3], "n": [1, 50, 1]})
+        >>> [frame.filter(f)["subject_id"].to_list() for f in _subject_filters(counts, 10)]
+        [[1, 2, None], [3, 4, 5, 9]]
+
+        When everything fits there is one range, and it filters nothing:
+
+        >>> [frame.filter(f).height for f in _subject_filters(counts, 100)]
+        [7]
+    """
+    starts = (
+        counts.drop_nulls("subject_id")
+        .sort("subject_id")
+        .select("subject_id", n=pl.col("n").cast(pl.Int64))
+        .select("subject_id", bucket=(pl.col("n").cum_sum() - pl.col("n")) // max_rows)
+    )
+    cuts = starts.group_by("bucket").agg(pl.col("subject_id").min()).sort("bucket")["subject_id"][1:]
+
+    sid = pl.col("subject_id")
+    if cuts.is_empty():
+        return [pl.lit(True)]
+    return [
+        (sid < cuts[0]) | sid.is_null(),
+        *((sid >= lo) & (sid < hi) for lo, hi in itertools.pairwise(cuts)),
+        sid >= cuts[-1],
+    ]
+
+
+def _plan_chunks(shards: list[Path], available: set[str], max_rows: int | None) -> list[pl.LazyFrame]:
+    """Partition the dataset into chunks of about ``max_rows`` rows that never split a subject.
+
+    **Why chunk.** The per-subject and per-code aggregates count distinct ``(subject, time)`` and
+    ``(subject, code)`` pairs, so their state grows with the rows read, and the streaming engine's
+    buffering grows with it. Over a whole dataset peak memory is linear in the row count -- about
+    70 bytes a row in practice, which exhausts a 121 GB machine on a 2.7-billion-row cohort.
+    Collected one chunk at a time, it is bounded by the chunk instead.
+
+    **Why never split a subject.** Per-subject counts and every distinct-subject count are only
+    additive across chunks that share no subject.
+
+    The plan, cheapest first:
+
+    1. ``max_rows`` is ``None``, or the dataset fits in one chunk: one chunk, read in one pass.
+    2. Every subject lives in a single shard, as MEDS ETLs produce: consecutive shards are grouped up
+       to the budget, and any shard larger than the budget is split by subject-id range.
+    3. Some subject spans shards. That is non-conformant, but this tool exists to read broken ETL
+       output, so rather than give up the whole dataset is split by subject-id range instead.
+
+    Telling 2 from 3 costs one pass over ``subject_id`` alone, made one shard at a time so that its
+    memory is bounded by a shard rather than by the dataset; the row counts are parquet metadata.
+
+    Args:
+        shards: The data shard paths.
+        available: Column names present in at least one shard.
+        max_rows: The row budget per chunk, or ``None`` for a single pass.
+
+    Returns:
+        Normalized lazy frames (see :func:`_base_frame`) that together hold every row exactly once.
+
+    Examples:
+        >>> spec = {"data": {
+        ...     "0.parquet": {"subject_id": [1, 1, 2], "code": ["A", "B", "A"]},
+        ...     "1.parquet": {"subject_id": [3, 3, 3, 4], "code": ["A", "A", "B", "B"]},
+        ...     "2.parquet": {"subject_id": [5], "code": ["C"]},
+        ... }}
+        >>> def plan(max_rows):
+        ...     with yaml_disk(spec) as d:
+        ...         chunks = _plan_chunks(_shard_paths(d), {"subject_id", "code"}, max_rows)
+        ...         return [sorted(c.collect()["subject_id"].to_list()) for c in chunks]
+
+        With room to spare, the dataset is read in one pass:
+
+        >>> plan(None)
+        [[1, 1, 2, 3, 3, 3, 4, 5]]
+        >>> plan(100)
+        [[1, 1, 2, 3, 3, 3, 4, 5]]
+
+        Otherwise consecutive shards are grouped up to the budget:
+
+        >>> plan(5)
+        [[1, 1, 2], [3, 3, 3, 4, 5]]
+
+        And a shard too large for the budget on its own is split between its subjects:
+
+        >>> plan(3)
+        [[1, 1, 2], [3, 3, 3], [4], [5]]
+
+        If a subject spans shards, no shard grouping is safe, so the cut is made by subject across
+        the whole dataset. Subject 1 below is in both shards, and each chunk still holds all of it:
+
+        >>> spec = {"data": {
+        ...     "0.parquet": {"subject_id": [1, 2, 3], "code": ["A", "A", "A"]},
+        ...     "1.parquet": {"subject_id": [1, 4], "code": ["B", "B"]},
+        ... }}
+        >>> plan(3)
+        [[1, 1, 2], [3, 4]]
+    """
+    if max_rows is None:
+        return [_base_frame(shards, available)]
+    rows = [pl.scan_parquet(shard).select(pl.len()).collect().item() for shard in shards]
+    if sum(rows) <= max_rows:
+        return [_base_frame(shards, available)]
+
+    # Counted shard by shard rather than in one query over the concatenated shards. The result is
+    # the same, since the shard is part of the key, but on a 1.1-billion-row cohort the single query
+    # peaked at 7-8 GB, more than the chunked aggregation this plan exists to bound.
+    counts = pl.concat(
+        [
+            _base_frame([s], available)
+            .group_by("subject_id")
+            .agg(n=pl.len())
+            .select(pl.lit(i).alias("shard"), "subject_id", "n")
+            .collect(engine="streaming")
+            for i, s in enumerate(shards)
+        ]
+    )
+    if counts["subject_id"].is_duplicated().any():
+        everything = _base_frame(shards, available)
+        totals = counts.group_by("subject_id").agg(pl.col("n").sum())
+        return [everything.filter(f) for f in _subject_filters(totals, max_rows)]
+
+    chunks: list[pl.LazyFrame] = []
+    group: list[Path] = []
+    group_rows = 0
+    for i, (shard, n) in enumerate(zip(shards, rows, strict=True)):
+        if group and group_rows + n > max_rows:
+            chunks.append(_base_frame(group, available))
+            group, group_rows = [], 0
+        if n > max_rows:
+            whole_shard = _base_frame([shard], available)
+            filters = _subject_filters(counts.filter(pl.col("shard") == i), max_rows)
+            chunks.extend(whole_shard.filter(f) for f in filters)
+            continue
+        group.append(shard)
+        group_rows += n
+    if group:
+        chunks.append(_base_frame(group, available))
+    return chunks
+
+
+def _chunk_aggregates(base: pl.LazyFrame, vocab: pl.DataFrame | None) -> dict[str, pl.DataFrame]:
+    """Collect every combinable aggregate over one chunk, in a single batch.
+
+    The queries are collected together so that polars can share the parquet scan and common subplans
+    across them: the chunk is read once rather than once per statistic.
+
+    Args:
+        base: One chunk of the normalized four-column frame.
+        vocab: Optional ``(code, vocabulary)`` mapping to attribute measurements to ontologies.
 
     Returns:
         A dict of collected frames keyed by aggregate name.
-
-    Examples:
-        >>> spec = {"data": {"0.parquet": {
-        ...     "subject_id": [1, 1, 2], "code": ["GLU", "GLU", "HR"],
-        ...     "numeric_value": [1.0, 3.0, 60.0],
-        ... }}}
-        >>> with yaml_disk(spec) as d:
-        ...     frames = _aggregate(_base_frame(_shard_paths(d), {"subject_id", "code", "numeric_value"}),
-        ...                         ExtractConfig(), None)
-        >>> sorted(frames)
-        ['by_year', 'overall', 'per_code', 'per_subject']
-        >>> frames["per_code"].sort("code").select("code", "n_measurements", "n_subjects")
-        shape: (2, 3)
-        ┌──────┬────────────────┬────────────┐
-        │ code ┆ n_measurements ┆ n_subjects │
-        │ ---  ┆ ---            ┆ ---        │
-        │ str  ┆ u32            ┆ u32        │
-        ╞══════╪════════════════╪════════════╡
-        │ GLU  ┆ 2              ┆ 1          │
-        │ HR   ┆ 1              ┆ 1          │
-        └──────┴────────────────┴────────────┘
-        >>> frames["overall"].select("n_measurements", "n_subjects", "numeric_mean").to_dicts()
-        [{'n_measurements': 3, 'n_subjects': 2, 'numeric_mean': 21.333333333333332}]
-
-        When code metadata supplies a ``(code, vocabulary)`` mapping, an extra aggregate attributes
-        measurement volume and numeric moments to each external vocabulary. A code mapped into two
-        vocabularies is counted under both, so these columns do not sum to the dataset total:
-
-        >>> vocab_map = pl.LazyFrame({"code": ["GLU", "GLU", "HR"],
-        ...                           "vocabulary": ["LOINC", "SNOMED", "LOINC"]})
-        >>> with yaml_disk(spec) as d:
-        ...     frames = _aggregate(_base_frame(_shard_paths(d), {"subject_id", "code", "numeric_value"}),
-        ...                         ExtractConfig(), vocab_map)
-        >>> frames["by_vocabulary"].sort("vocabulary").select(
-        ...     "vocabulary", "n_measurements", "n_subjects", "n_child_codes")
-        shape: (2, 4)
-        ┌────────────┬────────────────┬────────────┬───────────────┐
-        │ vocabulary ┆ n_measurements ┆ n_subjects ┆ n_child_codes │
-        │ ---        ┆ ---            ┆ ---        ┆ ---           │
-        │ str        ┆ u32            ┆ u32        ┆ u32           │
-        ╞════════════╪════════════════╪════════════╪═══════════════╡
-        │ LOINC      ┆ 3              ┆ 2          ┆ 2             │
-        │ SNOMED     ┆ 2              ┆ 1          ┆ 1             │
-        └────────────┴────────────────┴────────────┴───────────────┘
-
-        A parallel aggregate covers the measurements whose code maps into no vocabulary at all,
-        which is the signal that a concept-mapping table has stopped resolving:
-
-        >>> frames["unmapped"].to_dicts()
-        [{'n_measurements': 0}]
     """
     nv = pl.col("numeric_value")
     finite = _finite_numeric()
+    observed = _observed()
+    observed_time = pl.when(observed).then(pl.col("time"))
 
     queries: dict[str, pl.LazyFrame] = {
         "overall": base.select(
@@ -831,6 +1050,10 @@ def _aggregate(
             t_max=pl.col("time").max(),
             has_birth=(pl.col("code") == meds.birth_code).any(),
             has_death=(pl.col("code") == meds.death_code).any(),
+            # The inputs to `per_subject.measurements_per_day`; see `_measurements_per_day`.
+            n_observed=observed.sum(),
+            t_observed_min=observed_time.min(),
+            t_observed_max=observed_time.max(),
         ),
         "per_code": base.group_by("code").agg(
             n_measurements=pl.len(),
@@ -844,11 +1067,11 @@ def _aggregate(
         .agg(n_measurements=pl.len(), n_subjects=pl.col("subject_id").n_unique()),
     }
 
-    if vocab_map is not None:
+    if vocab is not None:
         # A code with parents in two vocabularies is counted under both, so these columns
         # deliberately over-sum relative to the dataset total.
         queries["by_vocabulary"] = (
-            base.join(vocab_map, on="code", how="inner")
+            base.join(vocab.lazy(), on="code", how="inner")
             .group_by("vocabulary")
             .agg(
                 n_measurements=pl.len(),
@@ -859,21 +1082,241 @@ def _aggregate(
                 numeric_std=finite.std(),
             )
         )
-        queries["unmapped"] = base.join(vocab_map.select("code").unique(), on="code", how="anti").select(
+        queries["unmapped"] = base.join(vocab.lazy().select("code").unique(), on="code", how="anti").select(
             n_measurements=pl.len()
-        )
-
-    if cfg.numeric_detail == "quantiles":
-        queries["numeric_quantiles"] = base.select(
-            **{f"q{_qkey(q)}": finite.quantile(q, "linear") for q in cfg.quantiles}
-        )
-        queries["time_quantiles"] = base.drop_nulls("time").select(
-            **{f"q{_qkey(q)}": pl.col("time").dt.epoch("us").quantile(q, "linear") for q in cfg.quantiles}
         )
 
     names = list(queries)
     collected = pl.collect_all([queries[n] for n in names], engine="streaming")
     return dict(zip(names, collected, strict=True))
+
+
+def _pooled_moments() -> list[pl.Expr]:
+    """Pool per-chunk ``numeric_mean`` and ``numeric_std`` into whole-dataset ones.
+
+    The parallel form of Welford's update (Chan, Golub & LeVeque): each chunk contributes its sum of
+    squared deviations, ``std**2 * (n - 1)``, plus a between-chunk term for how far its mean sits from
+    the pooled mean. That is exact in real arithmetic, and in floating point agrees with a single pass
+    far inside the six significant digits the document carries. When only one chunk holds any finite
+    value -- every key in a single-chunk run, and most rare codes in a chunked one -- its moments pass
+    through untouched.
+
+    Works as a ``select`` over stacked partials, or inside ``group_by(...).agg``.
+
+    Examples:
+        >>> def moments(frame):
+        ...     return frame.select(numeric_n_finite=pl.len(), numeric_mean=pl.col("x").mean(),
+        ...                         numeric_std=pl.col("x").std())
+        >>> parts = [pl.DataFrame({"x": xs}) for xs in ([1.0, 2.0], [4.0], [8.0, 16.0, 32.0])]
+        >>> pooled = pl.concat([moments(p) for p in parts]).select(_pooled_moments())
+        >>> single_pass = moments(pl.concat(parts)).drop("numeric_n_finite")
+        >>> [abs(a - b) < 1e-12 for a, b in zip(pooled.row(0), single_pass.row(0))]
+        [True, True]
+
+        Chunks without a finite value contribute nothing, and none at all yields nulls, as a
+        single pass over no values would:
+
+        >>> parts = pl.DataFrame({"numeric_n_finite": [0, 1, 0], "numeric_mean": [None, 5.0, None],
+        ...                       "numeric_std": [None, None, None]})
+        >>> parts.select(_pooled_moments()).row(0)
+        (5.0, None)
+        >>> parts.head(1).select(_pooled_moments()).row(0)
+        (None, None)
+    """
+    n = pl.col("numeric_n_finite").cast(pl.Float64)
+    mean = pl.col("numeric_mean")
+    std = pl.col("numeric_std")
+
+    holds = n > 0
+    n_holding = holds.sum()
+    n_total = n.sum()
+    pooled_mean = (n * mean).filter(holds).sum() / n_total
+    m2 = (std.fill_null(0.0).pow(2) * (n - 1) + n * (mean - pooled_mean).pow(2)).filter(holds).sum()
+    return [
+        pl.when(n_holding == 1)
+        .then(mean.filter(holds).first())
+        .when(n_holding > 1)
+        .then(pooled_mean)
+        .alias("numeric_mean"),
+        pl.when(n_holding == 1)
+        .then(std.filter(holds).first())
+        .when(n_holding > 1)
+        .then((m2 / (n_total - 1)).sqrt())
+        .alias("numeric_std"),
+    ]
+
+
+def _summed(*names: str) -> list[pl.Expr]:
+    """Sum count columns across chunks, widened first so totals past 2**32 cannot wrap."""
+    return [pl.col(name).cast(pl.UInt64).sum() for name in names]
+
+
+def _combine_partials(
+    partials: list[dict[str, pl.DataFrame]], vocab: pl.DataFrame | None
+) -> dict[str, pl.DataFrame]:
+    """Combine per-chunk aggregates into whole-dataset ones.
+
+    Exact because no subject spans two chunks (see :func:`_plan_chunks`): per-subject rows
+    concatenate, and every distinct-subject count sums. Two counts are distinct over *codes*, which
+    do recur across chunks, so they are recomputed from the combined per-code frame instead -- the
+    dataset's ``n_unique_codes`` and each vocabulary's ``n_child_codes``. Moments are pooled by
+    :func:`_pooled_moments`.
+
+    Args:
+        partials: One dict of frames per chunk, as returned by :func:`_chunk_aggregates`.
+        vocab: The ``(code, vocabulary)`` mapping, if any.
+
+    Returns:
+        A dict of frames with the same names and columns as each partial.
+
+    Examples:
+        Two chunks with one subject each, both measuring code ``A``:
+
+        >>> frame = pl.LazyFrame(
+        ...     {"subject_id": [1, 1, 2], "time": [None, None, None], "code": ["A", "B", "A"],
+        ...      "numeric_value": [1.0, None, 3.0]},
+        ...     schema_overrides={"time": pl.Datetime("us")})
+        >>> parts = [_chunk_aggregates(frame.filter(pl.col("subject_id") == s), None) for s in (1, 2)]
+        >>> combined = _combine_partials(parts, None)
+
+        Subjects are disjoint, so subject counts add. Codes are not, so ``n_unique_codes`` is 2, not
+        the 2 + 1 a sum would give:
+
+        >>> combined["overall"].select("n_measurements", "n_subjects", "n_unique_codes").row(0)
+        (3, 2, 2)
+        >>> combined["per_code"].sort("code").select("code", "n_subjects", "numeric_mean").rows()
+        [('A', 2, 2.0), ('B', 1, None)]
+    """
+    stacked = {name: pl.concat([part[name] for part in partials]) for name in partials[0]}
+
+    per_code = (
+        stacked["per_code"]
+        .group_by("code")
+        .agg(*_summed("n_measurements", "n_subjects", "numeric_n_finite"), *_pooled_moments())
+    )
+    not_summed = ("n_unique_codes", "numeric_mean", "numeric_std")
+    overall_counts = [c for c in stacked["overall"].columns if c not in not_summed]
+    combined = {
+        "overall": stacked["overall"].select(
+            *_summed(*overall_counts),
+            *_pooled_moments(),
+            n_unique_codes=pl.lit(per_code.height, pl.UInt64),
+        ),
+        "per_subject": stacked["per_subject"],
+        "per_code": per_code,
+        "by_year": stacked["by_year"].group_by("year").agg(*_summed("n_measurements", "n_subjects")),
+    }
+    if vocab is not None:
+        n_child_codes = per_code.join(vocab, on="code").group_by("vocabulary").agg(n_child_codes=pl.len())
+        combined["by_vocabulary"] = (
+            stacked["by_vocabulary"]
+            .group_by("vocabulary")
+            .agg(*_summed("n_measurements", "n_subjects", "numeric_n_finite"), *_pooled_moments())
+            .join(n_child_codes, on="vocabulary", how="left")
+        )
+        combined["unmapped"] = stacked["unmapped"].select(*_summed("n_measurements"))
+
+    # Keep each frame's column order, so a combined frame reads exactly like a single chunk's.
+    return {name: frame.select(partials[0][name].columns) for name, frame in combined.items()}
+
+
+def _aggregate(
+    chunks: list[pl.LazyFrame], cfg: ExtractConfig, vocab_map: pl.LazyFrame | None
+) -> dict[str, pl.DataFrame]:
+    """Run every data-scanning aggregate, chunk by chunk, and combine the results.
+
+    Chunks are collected one after another, so only one chunk's aggregation state is ever resident;
+    see :func:`_plan_chunks` for why that matters and :func:`_combine_partials` for why the result is
+    the same as a single pass.
+
+    Full-column quantiles (``numeric_detail="quantiles"``) cannot be assembled from parts, so they are
+    collected afterwards over the whole dataset, one column at a time. Their memory does grow with the
+    data, which is why they are opt-in.
+
+    Args:
+        chunks: The normalized four-column frame, partitioned as by :func:`_plan_chunks`.
+        cfg: Extraction configuration.
+        vocab_map: Optional ``(code, vocabulary)`` mapping to attribute measurements to ontologies.
+
+    Returns:
+        A dict of collected frames keyed by aggregate name.
+
+    Examples:
+        >>> spec = {"data": {"0.parquet": {
+        ...     "subject_id": [1, 1, 2], "code": ["GLU", "GLU", "HR"],
+        ...     "numeric_value": [1.0, 3.0, 60.0],
+        ... }}}
+        >>> with yaml_disk(spec) as d:
+        ...     frames = _aggregate([_base_frame(_shard_paths(d), {"subject_id", "code", "numeric_value"})],
+        ...                         ExtractConfig(), None)
+        >>> sorted(frames)
+        ['by_year', 'overall', 'per_code', 'per_subject']
+        >>> frames["per_code"].sort("code").select("code", "n_measurements", "n_subjects")
+        shape: (2, 3)
+        ┌──────┬────────────────┬────────────┐
+        │ code ┆ n_measurements ┆ n_subjects │
+        │ ---  ┆ ---            ┆ ---        │
+        │ str  ┆ u64            ┆ u64        │
+        ╞══════╪════════════════╪════════════╡
+        │ GLU  ┆ 2              ┆ 1          │
+        │ HR   ┆ 1              ┆ 1          │
+        └──────┴────────────────┴────────────┘
+        >>> frames["overall"].select("n_measurements", "n_subjects", "numeric_mean").to_dicts()
+        [{'n_measurements': 3, 'n_subjects': 2, 'numeric_mean': 21.333333333333332}]
+
+        Split by subject into two chunks, the result is the same:
+
+        >>> with yaml_disk(spec) as d:
+        ...     base = _base_frame(_shard_paths(d), {"subject_id", "code", "numeric_value"})
+        ...     chunked = _aggregate([base.filter(pl.col("subject_id") == s) for s in (1, 2)],
+        ...                          ExtractConfig(), None)
+        >>> chunked["overall"].select("n_measurements", "n_subjects", "numeric_mean").to_dicts()
+        [{'n_measurements': 3, 'n_subjects': 2, 'numeric_mean': 21.333333333333332}]
+
+        When code metadata supplies a ``(code, vocabulary)`` mapping, an extra aggregate attributes
+        measurement volume and numeric moments to each external vocabulary. A code mapped into two
+        vocabularies is counted under both, so these columns do not sum to the dataset total:
+
+        >>> vocab_map = pl.LazyFrame({"code": ["GLU", "GLU", "HR"],
+        ...                           "vocabulary": ["LOINC", "SNOMED", "LOINC"]})
+        >>> with yaml_disk(spec) as d:
+        ...     frames = _aggregate([_base_frame(_shard_paths(d), {"subject_id", "code", "numeric_value"})],
+        ...                         ExtractConfig(), vocab_map)
+        >>> frames["by_vocabulary"].sort("vocabulary").select(
+        ...     "vocabulary", "n_measurements", "n_subjects", "n_child_codes")
+        shape: (2, 4)
+        ┌────────────┬────────────────┬────────────┬───────────────┐
+        │ vocabulary ┆ n_measurements ┆ n_subjects ┆ n_child_codes │
+        │ ---        ┆ ---            ┆ ---        ┆ ---           │
+        │ str        ┆ u64            ┆ u64        ┆ u32           │
+        ╞════════════╪════════════════╪════════════╪═══════════════╡
+        │ LOINC      ┆ 3              ┆ 2          ┆ 2             │
+        │ SNOMED     ┆ 2              ┆ 1          ┆ 1             │
+        └────────────┴────────────────┴────────────┴───────────────┘
+
+        A parallel aggregate covers the measurements whose code maps into no vocabulary at all,
+        which is the signal that a concept-mapping table has stopped resolving:
+
+        >>> frames["unmapped"].to_dicts()
+        [{'n_measurements': 0}]
+    """
+    vocab = vocab_map.collect() if vocab_map is not None else None
+    frames = _combine_partials([_chunk_aggregates(chunk, vocab) for chunk in chunks], vocab)
+
+    if cfg.numeric_detail == "quantiles":
+        whole = chunks[0] if len(chunks) == 1 else pl.concat(chunks)
+        finite = _finite_numeric()
+        frames["numeric_quantiles"] = whole.select(
+            **{f"q{_qkey(q)}": finite.quantile(q, "linear") for q in cfg.quantiles}
+        ).collect(engine="streaming")
+        frames["time_quantiles"] = (
+            whole.drop_nulls("time")
+            .select(
+                **{f"q{_qkey(q)}": pl.col("time").dt.epoch("us").quantile(q, "linear") for q in cfg.quantiles}
+            )
+            .collect(engine="streaming")
+        )
+    return frames
 
 
 def _codes_block(per_code: pl.DataFrame, cfg: ExtractConfig) -> dict[str, Any]:
@@ -1109,7 +1552,7 @@ def _ontology_block(
     fp = meds_dir / meds.code_metadata_filepath
     if not fp.is_file():
         return {"present": False}
-    lf = pl.scan_parquet(fp)
+    lf = _scan_code_metadata(fp)
     if "parent_codes" not in lf.collect_schema():
         return {"present": False}
 
@@ -1256,7 +1699,7 @@ def _code_metadata_block(
     if not fp.is_file():
         return {"present": False}
 
-    lf = pl.scan_parquet(fp)
+    lf = _scan_code_metadata(fp)
     schema = lf.collect_schema()
     metadata_codes = lf.select("code").collect()["code"]
     observed_codes = set(per_code["code"].to_list())
@@ -1430,6 +1873,52 @@ def _counts_block(overall: pl.DataFrame, per_subject: pl.DataFrame) -> dict[str,
     }
 
 
+def _measurements_per_day(per_subject: pl.DataFrame) -> pl.Series:
+    """Each subject's measurement rate, or null where it is undefined.
+
+    The rate is ``n_observed`` divided by the time from ``t_observed_min`` to ``t_observed_max``,
+    in days. All three are computed over the same rows, those selected by :func:`_observed`, so
+    every row counted falls inside the span. The rate is computed per subject and only then
+    summarized, so its quantiles describe subjects. A ratio of the mean count to the mean span
+    would not.
+
+    A subject whose span is zero has no rate: one distinct timestamp, or none at all. Such subjects
+    are null here, so :func:`_distribution` leaves them out and its ``n`` counts only the subjects
+    that have a rate. They are not given an infinite or zero rate.
+
+    Args:
+        per_subject: The per-subject aggregate, with ``n_observed``, ``t_observed_min``, and
+            ``t_observed_max``.
+
+    Returns:
+        A ``Float64`` series aligned with ``per_subject``, in measurements per day.
+
+    Examples:
+        Ten rows over four days, then three rows over twelve hours. A third subject's rows all
+        share one timestamp, and a fourth has no timestamped rows that count:
+
+        >>> per_subject = pl.DataFrame({
+        ...     "n_observed": [10, 3, 4, 0],
+        ...     "t_observed_min": [datetime(2020, 1, 1), datetime(2020, 1, 1), datetime(2020, 1, 1), None],
+        ...     "t_observed_max": [datetime(2020, 1, 5), datetime(2020, 1, 1, 12), datetime(2020, 1, 1),
+        ...                        None],
+        ... })
+        >>> _measurements_per_day(per_subject).to_list()
+        [2.5, 6.0, None, None]
+
+        The span is exact to the microsecond, so even a very short one gives a finite rate:
+
+        >>> one_second = pl.DataFrame({"n_observed": [2], "t_observed_min": [datetime(2020, 1, 1)],
+        ...                            "t_observed_max": [datetime(2020, 1, 1, 0, 0, 1)]})
+        >>> _measurements_per_day(one_second).to_list()
+        [172800.0]
+    """
+    span = pl.col("t_observed_max") - pl.col("t_observed_min")
+    days = span.dt.total_microseconds().cast(pl.Float64) / _MICROSECONDS_PER_DAY
+    rate = pl.when(days > 0).then(pl.col("n_observed").cast(pl.Float64) / days)
+    return per_subject.select(rate.alias("measurements_per_day")).to_series()
+
+
 def _per_subject_block(per_subject: pl.DataFrame, cfg: ExtractConfig) -> dict[str, Any]:
     """Summarize the per-subject distributions.
 
@@ -1442,14 +1931,31 @@ def _per_subject_block(per_subject: pl.DataFrame, cfg: ExtractConfig) -> dict[st
         ...     "n_measurements": [10, 20], "n_events": [2, 4], "n_unique_codes": [3, 5],
         ...     "t_min": [datetime(2020, 1, 1), datetime(2021, 1, 1)],
         ...     "t_max": [datetime(2020, 1, 11), datetime(2021, 1, 3)],
+        ...     "n_observed": [9, 19],
+        ...     "t_observed_min": [datetime(2020, 1, 2), datetime(2021, 1, 1)],
+        ...     "t_observed_max": [datetime(2020, 1, 5), datetime(2021, 1, 3)],
         ... })
         >>> block = _per_subject_block(per_subject, cfg)
         >>> sorted(block)
-        ['n_events', 'n_measurements', 'n_unique_codes', 'span_days']
+        ['measurements_per_day', 'n_events', 'n_measurements', 'n_unique_codes', 'span_days']
         >>> block["n_measurements"]
         {'n': 2, 'mean': 15.0, 'std': 7.07107, 'quantiles': {'p50': 15.0}}
         >>> block["span_days"]["mean"]
         6.0
+
+        The rate is computed per subject and then averaged: (9 / 3 + 19 / 2) / 2 = 6.25. A ratio
+        of the averages, 15 / 6 = 2.5, describes neither subject:
+
+        >>> block["measurements_per_day"]
+        {'n': 2, 'mean': 6.25, 'std': 4.59619, 'quantiles': {'p50': 6.25}}
+
+        A subject with no rate is left out of the distribution's ``n``. Here that leaves one
+        subject, below the floor of two, so only the count is reported:
+
+        >>> one_timestamp = per_subject.with_columns(t_observed_max=pl.col("t_observed_min"))
+        >>> _per_subject_block(one_timestamp.head(1).vstack(per_subject.tail(1)), cfg)[
+        ...     "measurements_per_day"]
+        {'n': 1, 'suppressed': True}
     """
     span_days = (per_subject["t_max"] - per_subject["t_min"]).dt.total_seconds().cast(pl.Float64) / 86400.0
     return {
@@ -1457,6 +1963,7 @@ def _per_subject_block(per_subject: pl.DataFrame, cfg: ExtractConfig) -> dict[st
         "n_events": _distribution(per_subject["n_events"].cast(pl.Float64), cfg),
         "n_unique_codes": _distribution(per_subject["n_unique_codes"].cast(pl.Float64), cfg),
         "span_days": _distribution(span_days, cfg),
+        "measurements_per_day": _distribution(_measurements_per_day(per_subject), cfg),
     }
 
 
@@ -1514,18 +2021,28 @@ def _time_block(
     return block
 
 
-def extract_summary_stats(meds_dir: str | Path, cfg: ExtractConfig | None = None) -> dict[str, Any]:
+def extract_summary_stats(
+    meds_dir: str | Path,
+    cfg: ExtractConfig | None = None,
+    *,
+    max_rows_per_chunk: int | None = DEFAULT_MAX_ROWS_PER_CHUNK,
+) -> dict[str, Any]:
     """Extract the full summary-statistics document for a MEDS dataset.
 
     Args:
         meds_dir: Root of the MEDS dataset (the directory containing ``data/`` and ``metadata/``).
         cfg: Extraction configuration. Defaults to :class:`~meds_summary_stats.config.ExtractConfig`.
+        max_rows_per_chunk: Roughly how many rows one aggregation pass may hold, which is what bounds
+            peak memory; ``None`` reads the whole dataset in one pass. This decides only how the
+            work is scheduled, never what it computes, so it is deliberately not part of ``cfg``
+            and not recorded in the document.
 
     Returns:
         A JSON-serializable dict. See :func:`write_summary_stats` for the on-disk form.
 
     Raises:
         NotAMEDSDatasetError: If ``meds_dir`` contains no readable data shards.
+        ValueError: If ``max_rows_per_chunk`` is not positive.
 
     Examples:
         >>> stats = extract_summary_stats(simple_static_MEDS)
@@ -1591,17 +2108,31 @@ def extract_summary_stats(meds_dir: str | Path, cfg: ExtractConfig | None = None
         >>> blob = json.dumps(stats)
         >>> any(code in blob for code in ("EYE_COLOR//BROWN", "MEDS_BIRTH", "HR", "TEMP"))
         False
+
+        Memory is bounded by aggregating in chunks, which never changes the result:
+
+        >>> chunked = extract_summary_stats(simple_static_MEDS, ExtractConfig(min_cell_size=1),
+        ...                                 max_rows_per_chunk=5)
+        >>> {k: v for k, v in chunked.items() if k != "extracted_at"} == {
+        ...     k: v for k, v in stats.items() if k != "extracted_at"}
+        True
+        >>> extract_summary_stats(simple_static_MEDS, max_rows_per_chunk=0)
+        Traceback (most recent call last):
+            ...
+        ValueError: max_rows_per_chunk must be >= 1 or None; got 0
     """
+    if max_rows_per_chunk is not None and max_rows_per_chunk < 1:
+        raise ValueError(f"max_rows_per_chunk must be >= 1 or None; got {max_rows_per_chunk}")
     meds_dir = Path(meds_dir)
     cfg = cfg or ExtractConfig()
 
     shards = _shard_paths(meds_dir)
     layout = _layout(meds_dir, shards)
     available = set(layout["data_columns"])
-    base = _base_frame(shards, available)
+    chunks = _plan_chunks(shards, available, max_rows_per_chunk)
 
     vocab_map = _code_vocabulary_map(meds_dir)
-    frames = _aggregate(base, cfg, vocab_map)
+    frames = _aggregate(chunks, cfg, vocab_map)
 
     per_subject = frames["per_subject"]
     per_code = frames["per_code"]

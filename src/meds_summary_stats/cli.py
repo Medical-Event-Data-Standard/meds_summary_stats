@@ -22,6 +22,7 @@ import yaml
 from .compare import ComparisonReport, compare_summary_stats
 from .config import ExtractConfig
 from .extract import (
+    DEFAULT_MAX_ROWS_PER_CHUNK,
     NotAMEDSDatasetError,
     extract_summary_stats,
     read_summary_stats,
@@ -88,6 +89,15 @@ def _extract_parser() -> argparse.ArgumentParser:
         "--emit-ontology-keys",
         action="store_true",
         help="List every key observed in each external vocabulary referenced by parent_codes.",
+    )
+    parser.add_argument(
+        "--max-rows-per-chunk",
+        type=int,
+        default=DEFAULT_MAX_ROWS_PER_CHUNK,
+        help=(
+            "Aggregate at most about this many rows at a time, which bounds peak memory. Changes only "
+            "how the work is scheduled, never the output (default: %(default)s)."
+        ),
     )
     return parser
 
@@ -174,11 +184,23 @@ def extract_main(argv: list[str] | None = None) -> int:
         1
         >>> sorted(stats["splits"]["by_split"])
         ['held_out', 'train', 'tuning']
+
+        The chunk budget schedules the work without being recorded, and a nonsensical one is an
+        input error:
+
+        >>> with tempfile.TemporaryDirectory() as tmp:
+        ...     out = Path(tmp) / "stats.json"
+        ...     extract_main([str(simple_static_MEDS), "-o", str(out), "--max-rows-per-chunk", "10"])
+        ...     "max_rows_per_chunk" in json.dumps(json.loads(out.read_text()))
+        0
+        False
+        >>> extract_main([str(simple_static_MEDS), "--max-rows-per-chunk", "0"])
+        3
     """
     args = _extract_parser().parse_args(argv)
     try:
         cfg = _resolve_extract_config(args)
-        stats = extract_summary_stats(args.meds_dir, cfg)
+        stats = extract_summary_stats(args.meds_dir, cfg, max_rows_per_chunk=args.max_rows_per_chunk)
     except (NotAMEDSDatasetError, FileNotFoundError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return EXIT_INPUT_ERROR

@@ -68,7 +68,7 @@ extract_MEDS_summary_stats examples/datasets/v1_baseline -o examples/stats/v1_ba
 ```
 
 That fingerprint is committed at [`examples/stats/v1_baseline.json`](examples/stats/v1_baseline.json)
-— 8 KB of JSON, safe to keep in version control next to the ETL that produced it. The headline
+— 10 KB of JSON, safe to keep in version control next to the ETL that produced it. The headline
 block:
 
 ```python
@@ -149,7 +149,7 @@ Re-extracting the same dataset reproduces it exactly, which is the property the 
 >>> from meds_summary_stats.compare import compare_summary_stats
 >>> from meds_summary_stats.report import render_text
 >>> print(render_text(compare_summary_stats(baseline, baseline)))
-PASS - 197 paths checked, 4 ignored, no findings.
+PASS - 207 paths checked, 4 ignored, no findings.
 
 ```
 
@@ -169,7 +169,7 @@ compare_MEDS_summary_stats examples/stats/v1_baseline.json current.json # exit 1
 >>> regressed = read_summary_stats(EXAMPLES / "stats" / "v1_etl_regression.json")
 >>> report = compare_summary_stats(baseline, regressed)
 >>> report.status, report.failed, report.counts
-('fail', True, {'error': 44, 'info': 0, 'warning': 22})
+('fail', True, {'error': 48, 'info': 0, 'warning': 24})
 
 ```
 
@@ -230,11 +230,11 @@ compare_MEDS_summary_stats examples/stats/v1_baseline.json current.json \
 >>> policy = ComparePolicy.from_dict({"on_dataset_version_change": "relax"})
 >>> relaxed = compare_summary_stats(baseline, refreshed, policy)
 >>> relaxed.status, relaxed.failed, relaxed.counts
-('warn', False, {'error': 0, 'info': 60, 'warning': 11})
+('warn', False, {'error': 0, 'info': 65, 'warning': 11})
 
 ```
 
-The 60 volume findings drop to informational. What survives as a warning is the *ordering* of the
+The 65 volume findings drop to informational. What survives as a warning is the *ordering* of the
 vocabulary by frequency, which genuinely did shift as the cohort grew, plus the file checksums,
 which are of course different files:
 
@@ -277,7 +277,7 @@ A single canonical JSON document. Roughly:
 | `counts`        | subjects, measurements, events, unique codes, static rows, births, deaths, global numeric moments, data-quality invariants |
 | `codes`         | vocabulary digests, occurrence distributions, concentration curves                                                         |
 | `code_metadata` | metadata coverage, plus per-external-vocabulary statistics and mapping coverage from `parent_codes`                        |
-| `per_subject`   | distributions of measurements, events, distinct codes, and record span per subject                                         |
+| `per_subject`   | distributions of measurements, events, distinct codes, record span, and measurements per day per subject                   |
 | `time`          | calendar-year histogram, optional time quantiles                                                                           |
 | `splits`        | per-split subject and measurement counts, plus data/split membership mismatches                                            |
 | `layout`        | shard count, column names and dtypes, per-shard presence, dtype conflicts                                                  |
@@ -418,14 +418,24 @@ input/output/exit-code tables.
 
 ## Performance
 
-One `scan_parquet` per shard, normalized and concatenated, then a handful of aggregates collected
-together on the polars streaming engine so the common scan is shared. The dataset is read a small
-fixed number of times regardless of its size, and the only frames materialized are per-subject and
-per-code — both orders of magnitude smaller than the data.
+Peak memory is bounded by a row budget, not by the size of the dataset. The per-subject and
+per-code aggregates count distinct `(subject, time)` and `(subject, code)` pairs, and over a whole
+dataset that state grows with every row read, so they are run in chunks of about
+`--max-rows-per-chunk` rows (default 10 million), collected one after another and combined exactly.
+Within a chunk the aggregates are collected together on the polars streaming engine, so the chunk is
+read once.
+
+Combining is exact only if no subject is split between chunks, so chunks follow subjects. MEDS
+shards hold disjoint sets of subjects, so consecutive shards are grouped up to the budget and an
+oversized shard is cut between subjects. A dataset where one subject spans shards is cut by subject
+across all shards instead. That layout is non-conformant, but the tool still has to read it. The
+budget only schedules the work: it is not recorded in the output, and the statistics are the same
+for any value of it.
 
 The default `numeric-detail: moments` needs no sorting. `quantiles` adds full-column quantiles over
-`numeric_value` and `time`, which does require materializing those columns; it is opt-in for that
-reason. Per-subject and per-code quantiles are always computed, since those frames are small.
+`numeric_value` and `time`, which cannot be combined from chunks and so does materialize those two
+columns; it is opt-in for that reason. Per-subject and per-code quantiles are always computed, since
+those frames are small.
 
 ## Installation
 

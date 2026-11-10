@@ -232,6 +232,20 @@
   },
   "meds_summary_stats_version": "0.0.0-example",
   "per_subject": {
+    "measurements_per_day": {
+      "mean": 0.829153,
+      "n": 160,
+      "quantiles": {
+        "p1": 0.00930812,
+        "p25": 0.0197586,
+        "p5": 0.0114798,
+        "p50": 0.0475754,
+        "p75": 0.892857,
+        "p95": 3.575,
+        "p99": 7.41
+      },
+      "std": 1.53534
+    },
     "n_events": {
       "mean": 14.1125,
       "n": 160,

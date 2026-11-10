@@ -362,7 +362,116 @@ thousand-shard dataset does not produce a thousand-line document.
 {'n': 6, 'mean': 10.3333, 'std': 4.13118, 'quantiles': {'p1': 7.0, 'p5': 7.0, 'p25': 7.0,
  'p50': 9.0, 'p75': 12.5, 'p95': 16.0, 'p99': 16.8}}
 >>> sorted(stats["per_subject"])
-['n_events', 'n_measurements', 'n_unique_codes', 'span_days']
+['measurements_per_day', 'n_events', 'n_measurements', 'n_unique_codes', 'span_days']
+
+```
+
+`span_days` runs from a subject's first timestamped row to their last, whatever the code, so it
+includes the birth row and is usually decades long.
+
+### `measurements_per_day` — each subject's own pace
+
+Dividing `n_measurements.mean` by `span_days.mean` gives a ratio of two averages, not the rate of a
+typical subject. `measurements_per_day` computes a rate for each subject first and then summarizes
+those rates, so its quantiles describe subjects.
+
+For each subject, it uses the rows that have a `time` and whose `code` is neither `MEDS_BIRTH` nor
+`MEDS_DEATH` (`meds.birth_code` and `meds.death_code`):
+
+- **numerator**: the number of those rows;
+- **span**: the time from the earliest of those rows to the latest, in days (exact to the
+    microsecond, 86,400 seconds to the day);
+- **rate**: numerator / span.
+
+The numerator and the span use exactly the same rows, so every row counted falls inside the span.
+Static rows have no time, so they cannot fall inside a span. The two life events that MEDS defines
+are left out because neither marks the start or end of care. Birth is usually decades before the
+record starts. A death recorded from a registry can come long after the last encounter. A death
+recorded in hospital is at the end of the stay anyway, so leaving it out changes little. No other
+code is treated specially.
+
+A subject whose span is zero has no rate: fewer than two distinct timestamps are left, or none at
+all. Such subjects are left out of the distribution rather than given an infinite or zero rate, so
+`n` counts only the subjects that have a rate. Every other `per_subject` distribution covers every
+subject, so the number left out is `n_measurements.n - measurements_per_day.n`. Quantiles are
+suppressed below `min_numeric_cell_size` of the counted subjects, as for every other distribution.
+
+On the fixture, the birth row alone stretches `span_days` to about 29 years:
+
+```python
+>>> stats["per_subject"]["span_days"]["mean"]
+10492.4
+>>> stats["per_subject"]["measurements_per_day"]
+{'n': 6, 'mean': 108.798, 'std': 70.658, 'quantiles': {'p1': 41.348, 'p5': 43.2586,
+ 'p25': 59.3581, 'p50': 95.5405, 'p75': 128.632, 'p95': 209.54, 'p99': 229.008}}
+
+```
+
+Each subject's stay lasts a couple of hours, so the rates are around a hundred measurements per
+day. The ratio of averages, 10.3 / 10,492, would report about 0.001.
+
+A small worked example, where the values can be checked by hand:
+
+```python
+>>> spec = {"data": {"0.parquet": {
+...     "subject_id": [1, 1, 1, 1, 1, 1,  2, 2, 2, 2, 2,  3, 3, 3,  4, 4],
+...     "time": [None, datetime(1980, 1, 1), datetime(2020, 1, 1), datetime(2020, 1, 1, 12),
+...              datetime(2020, 1, 3), datetime(2025, 6, 1),
+...              datetime(1990, 5, 5), datetime(2020, 2, 1), datetime(2020, 2, 1, 2),
+...              datetime(2020, 2, 1, 4), datetime(2020, 2, 1, 6),
+...              datetime(1970, 3, 3), datetime(2021, 1, 1), datetime(2021, 1, 1),
+...              None, datetime(1960, 7, 7)],
+...     "code": ["EYE_COLOR//BLUE", "MEDS_BIRTH", "HR", "HR", "TEMP", "MEDS_DEATH",
+...              "MEDS_BIRTH", "HR", "HR", "TEMP", "HR",
+...              "MEDS_BIRTH", "HR", "TEMP",
+...              "EYE_COLOR//BROWN", "MEDS_BIRTH"],
+... }}}
+>>> small = ExtractConfig(min_cell_size=1, min_numeric_cell_size=2, quantiles=(0.5,))
+>>> with yaml_disk(spec) as d:
+...     per_subject = extract_summary_stats(d, small)["per_subject"]
+>>> per_subject["measurements_per_day"]
+{'n': 2, 'mean': 8.75, 'std': 10.253, 'quantiles': {'p50': 8.75}}
+
+```
+
+- Subject 1 has three rows left, from 1 January 00:00 to 3 January 00:00: 3 / 2 days = 1.5. Their
+    static row, their birth in 1980 and their death in 2025 are all left out.
+- Subject 2 has four rows left over six hours: 4 / 0.25 days = 16.
+- Subject 3 has two rows, both at the same timestamp, so their span is zero and they have no rate.
+- Subject 4 has only a static row and a birth, so no rows are left and they have no rate.
+
+All four count toward `n_measurements`, but only two have a rate:
+
+```python
+>>> per_subject["n_measurements"]["n"] - per_subject["measurements_per_day"]["n"]
+2
+
+```
+
+With a floor of three, those two subjects are too few, and only the count is reported:
+
+```python
+>>> with yaml_disk(spec) as d:
+...     extract_summary_stats(d, ExtractConfig(min_numeric_cell_size=3))["per_subject"][
+...         "measurements_per_day"]
+{'n': 2, 'suppressed': True}
+
+```
+
+This field is new, and adding it did not change the meaning of any existing field, so
+`stats_schema_version` stays the same. A baseline extracted before the field existed still
+compares. The new paths are reported as `added`, which the default policy treats as a warning
+rather than an error, so the comparison does not fail. Re-extract the baseline to clear the
+warnings:
+
+```python
+>>> from copy import deepcopy
+>>> from meds_summary_stats.compare import compare_summary_stats
+>>> older = deepcopy(stats)
+>>> del older["per_subject"]["measurements_per_day"]
+>>> report = compare_summary_stats(older, stats)
+>>> report.status, report.failed, {f.kind for f in report.findings}, len(report.findings)
+('warn', False, {'added'}, 10)
 
 ```
 

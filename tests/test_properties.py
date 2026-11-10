@@ -9,25 +9,36 @@ Three families:
 2. **Digest and comparison algebra.** Determinism, order sensitivity, tie-breaking, and the
     threshold semantics that the tolerance policy relies on.
 3. **Cross-implementation agreement.** The scalar and vectorized parsers of ``parent_codes`` must
-    agree everywhere, since they are separate code paths for the same rule.
+    agree everywhere, since they are separate code paths for the same rule. Likewise, the
+    per-subject measurement rate must agree with a row-by-row reading of its definition.
 """
 
 from __future__ import annotations
 
 import itertools
 import json
+import math
 import string
-from datetime import datetime
+from collections import defaultdict
+from datetime import datetime, timedelta
 
 import hypothesis.strategies as st
+import meds
 import polars as pl
 import pytest
 from hypothesis import HealthCheck, assume, given, settings
+from polars.testing import assert_frame_equal
 
 from meds_summary_stats.compare import compare_summary_stats, relative_delta
 from meds_summary_stats.config import SUPPRESSED, ExtractConfig
 from meds_summary_stats.digests import digest, format_moment, ordered_by
-from meds_summary_stats.extract import extract_summary_stats
+from meds_summary_stats.extract import (
+    _aggregate,
+    _code_vocabulary_map,
+    _plan_chunks,
+    _shard_paths,
+    extract_summary_stats,
+)
 from meds_summary_stats.flatten import escape, flatten, matches, specificity
 from meds_summary_stats.ontology import key_expr, split_parent_code, vocabulary_expr
 
@@ -101,8 +112,13 @@ def _rename(code: str, index: int) -> str:
     return f"RENAMED{index}"
 
 
-def _write(tmp_path, rows, code_rows, n_shards):
-    """Write generated rows out as a sharded MEDS dataset, keeping subjects whole per shard."""
+def _write(tmp_path, rows, code_rows, n_shards, scatter: bool = False):
+    """Write generated rows out as a sharded MEDS dataset.
+
+    By default each subject is kept whole within one shard, as MEDS ETLs produce. With ``scatter``,
+    rows are dealt round-robin across shards instead, so a subject spans several of them -- a
+    non-conformant layout that extraction must still read correctly.
+    """
     (tmp_path / "data").mkdir(parents=True, exist_ok=True)
     (tmp_path / "metadata").mkdir(parents=True, exist_ok=True)
 
@@ -119,10 +135,11 @@ def _write(tmp_path, rows, code_rows, n_shards):
 
     subjects = frame["subject_id"].unique().sort().to_list()
     for shard in range(n_shards):
-        assigned = subjects[shard::n_shards]
-        frame.filter(pl.col("subject_id").is_in(assigned)).write_parquet(
-            tmp_path / "data" / f"{shard}.parquet"
-        )
+        if scatter:
+            part = frame.gather_every(n_shards, offset=shard)
+        else:
+            part = frame.filter(pl.col("subject_id").is_in(subjects[shard::n_shards]))
+        part.write_parquet(tmp_path / "data" / f"{shard}.parquet")
 
     pl.DataFrame(
         code_rows,
@@ -230,6 +247,137 @@ class TestPrivacyInvariants:
         first.pop("extracted_at")
         second.pop("extracted_at")
         assert first == second
+
+
+@st.composite
+def meds_datasets_with_life_events(draw):
+    """A generated dataset in which each subject may also carry a birth and a death row.
+
+    ``meds_datasets`` never draws the MEDS life-event codes, and they are what
+    ``per_subject.measurements_per_day`` treats specially, so they are added here at arbitrary times,
+    including none at all and times far outside the subject's other rows.
+    """
+    rows, code_rows, n_shards = draw(meds_datasets())
+    moments = st.one_of(st.none(), st.datetimes(datetime(1900, 1, 1), datetime(2030, 12, 31)))
+    for subject_id in sorted({r["subject_id"] for r in rows}):
+        for code in (meds.birth_code, meds.death_code):
+            if draw(st.booleans()):
+                rows.append(
+                    {"subject_id": subject_id, "time": draw(moments), "code": code, "numeric_value": None}
+                )
+    return rows, code_rows, n_shards
+
+
+def _reference_measurements_per_day(rows: list[dict]) -> list[float]:
+    """Each subject's measurement rate, computed row by row from the documented definition.
+
+    The rows that count are the timestamped ones whose code is neither MEDS life event. The rate is their
+    number divided by the time from the earliest to the latest, in days, and a subject with no such span has
+    no rate.
+    """
+    times = defaultdict(list)
+    for row in rows:
+        if row["time"] is not None and row["code"] not in (meds.birth_code, meds.death_code):
+            times[row["subject_id"]].append(row["time"])
+    rates = []
+    for subject_times in times.values():
+        span_days = (max(subject_times) - min(subject_times)) / timedelta(days=1)
+        if span_days > 0:
+            rates.append(len(subject_times) / span_days)
+    return rates
+
+
+class TestMeasurementsPerDay:
+    """``per_subject.measurements_per_day`` must be exactly the distribution its definition describes."""
+
+    @settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @given(dataset=meds_datasets_with_life_events(), max_rows=st.one_of(st.none(), st.integers(1, 60)))
+    def test_the_rate_matches_a_row_by_row_reference(self, dataset, max_rows, tmp_path_factory):
+        rows, code_rows, n_shards = dataset
+        root = _write(tmp_path_factory.mktemp("meds"), rows, code_rows, n_shards)
+        cfg = ExtractConfig(min_cell_size=1, min_numeric_cell_size=1)
+        block = extract_summary_stats(root, cfg, max_rows_per_chunk=max_rows)["per_subject"][
+            "measurements_per_day"
+        ]
+
+        expected = pl.Series(_reference_measurements_per_day(rows), dtype=pl.Float64)
+        # Subjects without a span are left out of `n` rather than given an infinite or zero rate.
+        assert block["n"] == expected.len()
+        if expected.is_empty():
+            assert block == {"n": 0, "suppressed": True}
+            return
+
+        assert all(math.isfinite(v) and v > 0 for v in block["quantiles"].values()), block
+        # Emitted values carry six significant digits; the absolute floor covers a std that is zero
+        # in exact arithmetic but not in floating point.
+        tol = {"rel": 1e-5, "abs": 1e-9 * float(expected.abs().max())}
+        assert block["mean"] == pytest.approx(expected.mean(), **tol)
+        if expected.len() > 1:
+            assert block["std"] == pytest.approx(expected.std(), **tol)
+        for q in cfg.quantiles:
+            key = f"p{q * 100:g}".replace(".", "_")
+            assert block["quantiles"][key] == pytest.approx(expected.quantile(q, "linear"), **tol)
+
+    @settings(max_examples=25, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @given(dataset=meds_datasets_with_life_events(), floor=st.integers(2, 30))
+    def test_quantiles_never_describe_fewer_subjects_than_the_floor(self, dataset, floor, tmp_path_factory):
+        rows, code_rows, n_shards = dataset
+        root = _write(tmp_path_factory.mktemp("meds"), rows, code_rows, n_shards)
+        block = extract_summary_stats(root, ExtractConfig(min_numeric_cell_size=floor))["per_subject"][
+            "measurements_per_day"
+        ]
+        if block["n"] < floor:
+            assert block == {"n": block["n"], "suppressed": True}
+        else:
+            assert set(block) == {"n", "mean", "std", "quantiles"}
+
+
+class TestChunkedAggregation:
+    """Aggregating in bounded chunks is how extraction keeps memory flat; it must change nothing.
+
+    Distinct-subject counts only add across chunks that share no subject, so the planner has to keep every
+    subject whole -- including on a non-conformant dataset that scatters a subject across shards, which is
+    exactly the kind of broken output this tool exists to read.
+    """
+
+    @settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @given(dataset=meds_datasets(), max_rows=st.integers(1, 60), scatter=st.booleans())
+    def test_chunking_never_changes_an_aggregate(self, dataset, max_rows, scatter, tmp_path_factory):
+        rows, code_rows, n_shards = dataset
+        root = _write(tmp_path_factory.mktemp("meds"), rows, code_rows, n_shards, scatter=scatter)
+        shards = _shard_paths(root)
+        available = {"subject_id", "time", "code", "numeric_value"}
+        cfg = ExtractConfig(numeric_detail="quantiles")
+        vocab_map = _code_vocabulary_map(root)
+
+        whole = _aggregate(_plan_chunks(shards, available, None), cfg, vocab_map)
+        chunks = _plan_chunks(shards, available, max_rows)
+        chunked = _aggregate(chunks, cfg, vocab_map)
+
+        assert sorted(whole) == sorted(chunked)
+        for name, expected in whole.items():
+            keys = [k for k in ("subject_id", "code", "year", "vocabulary") if k in expected.columns]
+            actual = chunked[name]
+            if keys:
+                expected, actual = expected.sort(keys), actual.sort(keys)
+            # Moments pooled across chunks agree to rounding, not bit-for-bit; every count is exact
+            # because the tolerance is far below one.
+            assert_frame_equal(expected, actual, rel_tol=1e-9, abs_tol=1e-9)
+
+    @settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @given(dataset=meds_datasets(), max_rows=st.integers(1, 60), scatter=st.booleans())
+    def test_a_chunk_overshoots_its_budget_by_less_than_one_subject(
+        self, dataset, max_rows, scatter, tmp_path_factory
+    ):
+        """The budget is a bound, give or take the one subject that cannot be split."""
+        rows, code_rows, n_shards = dataset
+        root = _write(tmp_path_factory.mktemp("meds"), rows, code_rows, n_shards, scatter=scatter)
+        available = {"subject_id", "time", "code", "numeric_value"}
+
+        for chunk in _plan_chunks(_shard_paths(root), available, max_rows):
+            sizes = chunk.group_by("subject_id").agg(n=pl.len()).collect()["n"]
+            if sizes.len():
+                assert sizes.sum() < max_rows + sizes.max(), (max_rows, sizes.to_list())
 
 
 class TestDigests:
