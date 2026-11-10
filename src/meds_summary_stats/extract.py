@@ -110,23 +110,100 @@ def _qkey(q: float) -> str:
     return f"p{q * 100:g}".replace(".", "_")
 
 
+def _reportable_quantiles(n: int, cfg: ExtractConfig) -> tuple[float, ...]:
+    """The configured quantiles that can be reported over ``n`` values without exposing an extreme.
+
+    Every quantile in the document is computed with linear interpolation, which places quantile
+    ``q`` at position ``(n - 1) * q`` in the sorted values and mixes the two values either side of
+    it. Near the tail of a small sample, both of those can be the extremes: at ``n = 20``, ``p95``
+    and ``p99`` both lie between the second-largest and the largest value, and two linear
+    equations in two unknowns give the maximum back exactly. That would defeat the point of
+    reporting quantiles instead of a ``max``.
+
+    So a quantile is reported only if its position is at least 1 and at most ``n - 2``. Then
+    neither value it mixes is the smallest or the largest, and no change to either extreme can move
+    it. The check is the same floating-point product polars uses to place the quantile, so the two
+    cannot disagree at a boundary such as ``p5`` at ``n = 21``, which falls exactly on the second
+    value.
+
+    Below ``cfg.min_numeric_cell_size`` values nothing is reportable at all.
+
+    Args:
+        n: The number of values the quantiles would be computed over.
+        cfg: Supplies the suppression floor and the configured quantiles.
+
+    Returns:
+        The reportable subset of ``cfg.quantiles``, in order.
+
+    Examples:
+        With the default quantiles and floor, the tails need more data than the floor alone
+        requires. At the floor itself only the quartiles and median survive:
+
+        >>> cfg = ExtractConfig()
+        >>> cfg.quantiles, cfg.min_numeric_cell_size
+        ((0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99), 20)
+        >>> _reportable_quantiles(19, cfg)
+        ()
+        >>> _reportable_quantiles(20, cfg)
+        (0.25, 0.5, 0.75)
+
+        ``p5`` and ``p95`` need 21 values, and ``p1`` and ``p99`` need 101:
+
+        >>> _reportable_quantiles(21, cfg)
+        (0.05, 0.25, 0.5, 0.75, 0.95)
+        >>> _reportable_quantiles(100, cfg) == _reportable_quantiles(21, cfg)
+        True
+        >>> _reportable_quantiles(101, cfg) == cfg.quantiles
+        True
+
+        With the floor lowered, small samples report fewer quantiles still. Even the median of two
+        values is their midpoint, a mix of both extremes, so it is withheld; three values are the
+        fewest that leave a median to report:
+
+        >>> low = ExtractConfig(min_numeric_cell_size=1, quantiles=(0.25, 0.5, 0.75))
+        >>> [_reportable_quantiles(n, low) for n in (1, 2, 3, 4, 5)]
+        [(), (), (0.5,), (0.5,), (0.25, 0.5, 0.75)]
+    """
+    if n < cfg.min_numeric_cell_size:
+        return ()
+    return tuple(q for q in cfg.quantiles if 1 <= (n - 1) * q <= n - 2)
+
+
 def _distribution(series: pl.Series, cfg: ExtractConfig) -> dict[str, Any]:
     """Summarize a numeric series as counts, moments, and quantiles.
 
     Below ``cfg.min_numeric_cell_size`` non-null values, only the count is emitted: quantiles over a
-    handful of observations are close to reporting the observations themselves.
+    handful of observations are close to reporting the observations themselves. Above it, a
+    quantile that would depend on the smallest or largest value is left out of ``quantiles`` (see
+    :func:`_reportable_quantiles`), so small samples report fewer quantiles than large ones.
 
     Args:
         series: The values to summarize. Nulls are excluded from every statistic.
         cfg: Supplies the suppression floor and the quantiles to report.
 
     Returns:
-        A dict with ``n`` and, when not suppressed, ``mean``, ``std``, and ``quantiles``.
+        A dict with ``n`` and, when not suppressed, ``mean``, ``std``, and ``quantiles``. The
+        ``quantiles`` key is present whenever the summary is not suppressed, so the document's shape
+        depends only on the floor; it is an empty mapping when no configured quantile can be
+        reported at this ``n``.
 
     Examples:
         >>> cfg = ExtractConfig(min_numeric_cell_size=3, quantiles=(0.5,))
         >>> _distribution(pl.Series([1.0, 2.0, 3.0, None]), cfg)
         {'n': 3, 'mean': 2.0, 'std': 1.0, 'quantiles': {'p50': 2.0}}
+
+        The tails are withheld until the sample is large enough that they do not touch the extremes.
+        With the default quantiles at 20 values, a record of 3,652 days among nineteen of about a
+        month cannot be read back out of what is reported:
+
+        >>> spans = pl.Series([10 + 1.5 * i for i in range(19)] + [3652.75])
+        >>> _distribution(spans, ExtractConfig())["quantiles"]
+        {'p25': 17.125, 'p50': 24.25, 'p75': 31.375}
+
+        When no quantile can be reported, the mapping is empty rather than absent:
+
+        >>> _distribution(pl.Series([1.0, 2.0]), ExtractConfig(min_numeric_cell_size=2, quantiles=(0.5,)))
+        {'n': 2, 'mean': 1.5, 'std': 0.707107, 'quantiles': {}}
 
         Below the floor, the summary collapses to a bare count plus an explicit marker, so a reader
         can tell "suppressed" from "absent":
@@ -160,7 +237,9 @@ def _distribution(series: pl.Series, cfg: ExtractConfig) -> dict[str, Any]:
         "n": n,
         "mean": _round_sig(series.mean()),
         "std": _round_sig(series.std()),
-        "quantiles": {_qkey(q): _round_sig(series.quantile(q, "linear")) for q in cfg.quantiles},
+        "quantiles": {
+            _qkey(q): _round_sig(series.quantile(q, "linear")) for q in _reportable_quantiles(n, cfg)
+        },
     }
 
 
@@ -1304,15 +1383,20 @@ def _aggregate(
     frames = _combine_partials([_chunk_aggregates(chunk, vocab) for chunk in chunks], vocab)
 
     if cfg.numeric_detail == "quantiles":
+        # Each frame carries `n`, the number of values its quantiles were computed over, from the
+        # same query, so `_reportable_quantiles` judges exactly the sample the quantiles describe.
         whole = chunks[0] if len(chunks) == 1 else pl.concat(chunks)
         finite = _finite_numeric()
         frames["numeric_quantiles"] = whole.select(
-            **{f"q{_qkey(q)}": finite.quantile(q, "linear") for q in cfg.quantiles}
+            n=finite.count(), **{f"q{_qkey(q)}": finite.quantile(q, "linear") for q in cfg.quantiles}
         ).collect(engine="streaming")
         frames["time_quantiles"] = (
             whole.drop_nulls("time")
             .select(
-                **{f"q{_qkey(q)}": pl.col("time").dt.epoch("us").quantile(q, "linear") for q in cfg.quantiles}
+                n=pl.len(),
+                **{
+                    f"q{_qkey(q)}": pl.col("time").dt.epoch("us").quantile(q, "linear") for q in cfg.quantiles
+                },
             )
             .collect(engine="streaming")
         )
@@ -1939,7 +2023,7 @@ def _per_subject_block(per_subject: pl.DataFrame, cfg: ExtractConfig) -> dict[st
         >>> sorted(block)
         ['measurements_per_day', 'n_events', 'n_measurements', 'n_unique_codes', 'span_days']
         >>> block["n_measurements"]
-        {'n': 2, 'mean': 15.0, 'std': 7.07107, 'quantiles': {'p50': 15.0}}
+        {'n': 2, 'mean': 15.0, 'std': 7.07107, 'quantiles': {}}
         >>> block["span_days"]["mean"]
         6.0
 
@@ -1947,7 +2031,7 @@ def _per_subject_block(per_subject: pl.DataFrame, cfg: ExtractConfig) -> dict[st
         of the averages, 15 / 6 = 2.5, describes neither subject:
 
         >>> block["measurements_per_day"]
-        {'n': 2, 'mean': 6.25, 'std': 4.59619, 'quantiles': {'p50': 6.25}}
+        {'n': 2, 'mean': 6.25, 'std': 4.59619, 'quantiles': {}}
 
         A subject with no rate is left out of the distribution's ``n``. Here that leaves one
         subject, below the floor of two, so only the count is reported:
@@ -1993,9 +2077,16 @@ def _time_block(
 
         With ``numeric_detail="quantiles"``, full-column time quantiles are added as ISO strings:
 
-        >>> tq = pl.DataFrame([{"qp50": 1577836800000000}])
+        >>> tq = pl.DataFrame([{"n": 1102, "qp50": 1577836800000000}])
         >>> _time_block(by_year, tq, ExtractConfig(quantiles=(0.5,)))["quantiles"]
         {'p50': '2020-01-01T00:00:00'}
+
+        As everywhere, a quantile that would depend on the earliest or latest timestamp is withheld,
+        and below ``min_numeric_cell_size`` timestamped rows none is reported:
+
+        >>> tq = pl.DataFrame([{"n": 5, "qp50": 1577836800000000}])
+        >>> _time_block(by_year, tq, ExtractConfig(quantiles=(0.5,)))["quantiles"]
+        {}
     """
     rows = [
         {"year": str(r["year"]), "n_measurements": r["n_measurements"], "n_subjects": r["n_subjects"]}
@@ -2008,15 +2099,14 @@ def _time_block(
     }
     if time_quantiles is not None:
         row = time_quantiles.to_dicts()[0]
+        # A reportable quantile is never null: it needs at least three timestamped rows.
         block["quantiles"] = {
             _qkey(q): _iso(
                 datetime.datetime.fromtimestamp(row[f"q{_qkey(q)}"] / 1e6, tz=datetime.UTC).replace(
                     tzinfo=None
                 )
             )
-            if row[f"q{_qkey(q)}"] is not None
-            else None
-            for q in cfg.quantiles
+            for q in _reportable_quantiles(row["n"], cfg)
         }
     return block
 
@@ -2164,7 +2254,7 @@ def extract_summary_stats(
     if (numeric_quantiles := frames.get("numeric_quantiles")) is not None:
         row = numeric_quantiles.to_dicts()[0]
         stats["counts"]["numeric"]["quantiles"] = {
-            _qkey(q): _round_sig(row[f"q{_qkey(q)}"]) for q in cfg.quantiles
+            _qkey(q): _round_sig(row[f"q{_qkey(q)}"]) for q in _reportable_quantiles(row["n"], cfg)
         }
     return stats
 
