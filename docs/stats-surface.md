@@ -242,7 +242,9 @@ This is the block that catches a class of regression nothing else can. When a co
 silently stops resolving, the ETL still emits every row: the subject count, measurement count, code
 count, and schema are all identical. What changes is that codes stop reaching an ontology —
 `frac_measurements_mapped` falls, `n_observed_codes_without_parents` rises. The default policy
-treats any downward movement in the former as at least a warning.
+treats any movement in the former, in either direction, as at least a warning: a fall is the
+regression described above, and an unexpected rise, such as a join that starts fanning out, deserves
+a look too.
 
 ### Structure of the linkage
 
@@ -458,11 +460,25 @@ With a floor of three, those two subjects are too few, and only the count is rep
 
 ```
 
-This field is new, and adding it did not change the meaning of any existing field, so
-`stats_schema_version` stays the same. A baseline extracted before the field existed still
-compares. The new paths are reported as `added`, which the default policy treats as a warning
-rather than an error, so the comparison does not fail. Re-extract the baseline to clear the
-warnings:
+Adding this field did not change the meaning of any existing field, so on its own it would not have
+needed a new `stats_schema_version`. It ships in the same release as version 2, though, which
+changes how `code_metadata.n_with_description` and `n_with_parent_codes` count. Every baseline
+extracted before this field existed is version 1, and this build will not read it:
+
+```python
+>>> from meds_summary_stats.extract import read_summary_stats, write_summary_stats
+>>> with tempfile.TemporaryDirectory() as tmp:
+...     fp = write_summary_stats({**stats, "stats_schema_version": 1}, Path(tmp) / "baseline.json")
+...     read_summary_stats(fp)
+Traceback (most recent call last):
+    ...
+ValueError: .../baseline.json has stats_schema_version 1; this build understands 2
+
+```
+
+Re-extract such baselines with this release. From then on, a purely additive field like this one is
+reported as `added`, which the default policy treats as a warning rather than an error, so the
+comparison does not fail. Here the older baseline is simulated by removing the field:
 
 ```python
 >>> from copy import deepcopy
