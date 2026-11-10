@@ -23,7 +23,12 @@ import pytest
 from meds_summary_stats.cli import EXIT_INPUT_ERROR, EXIT_REGRESSION, compare_main, extract_main
 from meds_summary_stats.compare import compare_summary_stats
 from meds_summary_stats.config import SUPPRESSED, ExtractConfig
-from meds_summary_stats.extract import extract_summary_stats, read_summary_stats, write_summary_stats
+from meds_summary_stats.extract import (
+    STATS_SCHEMA_VERSION,
+    extract_summary_stats,
+    read_summary_stats,
+    write_summary_stats,
+)
 from meds_summary_stats.flatten import flatten
 from meds_summary_stats.policy import ComparePolicy
 
@@ -281,7 +286,7 @@ class TestConsoleScripts:
     def test_extract_script_streams_to_stdout(self, generated_sample_MEDS: Path):
         result = self._run("extract_MEDS_summary_stats", str(generated_sample_MEDS))
         assert result.returncode == 0, result.stderr
-        assert json.loads(result.stdout)["stats_schema_version"] == 1
+        assert json.loads(result.stdout)["stats_schema_version"] == STATS_SCHEMA_VERSION
 
     def test_compare_script_exit_codes(self, generated_sample_MEDS: Path, tmp_path: Path):
         good = tmp_path / "good.json"
