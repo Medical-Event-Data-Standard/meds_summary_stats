@@ -1858,6 +1858,9 @@ def _dataset_parents_block(meds_dir: Path, observed_codes: set[str]) -> dict[str
         >>> with yaml_disk({"metadata": {"codes.parquet": {"code": ["HR"]}}}) as d:
         ...     _dataset_parents_block(d, {"HR"})
         {'present': False}
+        >>> with yaml_disk({"data": {}}) as d:
+        ...     _dataset_parents_block(d, set())
+        {'present': False}
     """
     fp = meds_dir / meds.code_metadata_filepath
     if not fp.is_file():
