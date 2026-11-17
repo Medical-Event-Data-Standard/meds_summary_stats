@@ -75,6 +75,8 @@ KNOWN_VOCABULARIES: frozenset[str] = frozenset(
     }
 )
 
+_KNOWN_LOWERCASE: frozenset[str] = frozenset(v.lower() for v in KNOWN_VOCABULARIES)
+
 
 def split_parent_code(parent: str) -> tuple[str, str]:
     """Split a parent code into its ``(vocabulary, key)`` parts.
@@ -189,5 +191,21 @@ def is_recognized(vocabulary: str) -> bool:
         >>> is_recognized("MY_CUSTOM_VOCAB"), is_recognized("<no-vocabulary>")
         (False, False)
     """
-    lowered = {v.lower() for v in KNOWN_VOCABULARIES}
-    return vocabulary.lower() in lowered
+    return vocabulary.lower() in _KNOWN_LOWERCASE
+
+
+def recognized_expr(column: str = "vocabulary") -> pl.Expr:
+    """Polars expression for :func:`is_recognized` over a column of vocabulary names.
+
+    Args:
+        column: Name of the string column holding one vocabulary name per row.
+
+    Returns:
+        A boolean expression, case-insensitive like :func:`is_recognized`.
+
+    Examples:
+        >>> df = pl.DataFrame({"vocabulary": ["LOINC", "loinc", "LAB", "<no-vocabulary>"]})
+        >>> df.select(recognized_expr())["vocabulary"].to_list()
+        [True, True, False, False]
+    """
+    return pl.col(column).str.to_lowercase().is_in(sorted(_KNOWN_LOWERCASE))

@@ -463,6 +463,108 @@ def test_mapping_coverage_is_bounded_when_codes_span_vocabularies(tmp_path: Path
     assert ontology["n_codes_in_multiple_vocabularies"] == 2
 
 
+def test_in_dataset_parents_are_not_vocabularies(tmp_path: Path):
+    """A parent that is a code of the same ``codes.parquet`` is not an external vocabulary.
+
+    MEDS ETLs give unit siblings (``LAB//1//mg``, ``LAB//1//mcg``) their stem (``LAB//1``) as a
+    parent, and the stem a ``codes.parquet`` row of its own with no events. Read as a vocabulary
+    reference, every such stem would add a "vocabulary" named after a code prefix (``LAB``, ``MED``),
+    count its children as mapped, and print a piece of the dataset's own codes as a vocabulary name.
+    Adding stems must leave every vocabulary statistic and the mapped fractions exactly as they are
+    without them, and is reported in ``code_metadata.dataset_parents`` instead.
+    """
+
+    def build(root: Path, with_stems: bool) -> Path:
+        (root / "data").mkdir(parents=True)
+        (root / "metadata").mkdir(parents=True)
+        data_codes = ["LAB//1//mg", "LAB//1//mcg", "LAB//2", "MED//A//mg", "MED//A//mcg"]
+        pl.DataFrame(
+            {
+                "subject_id": [i // 4 for i in range(500)],
+                "time": [datetime(2020, 1, 1 + (i % 28)) for i in range(500)],
+                "code": [data_codes[i % 5] for i in range(500)],
+                "numeric_value": [float(i % 17) for i in range(500)],
+            },
+            schema={
+                "subject_id": pl.Int64,
+                "time": pl.Datetime("us"),
+                "code": pl.String,
+                "numeric_value": pl.Float32,
+            },
+        ).write_parquet(root / "data" / "0.parquet")
+        stem = ["LAB//1"] if with_stems else []
+        med_stem = ["MED//A"] if with_stems else []
+        codes = {
+            "LAB//1//mg": ["LOINC/1-1", *stem],
+            "LAB//1//mcg": ["LOINC/1-1", *stem],
+            "LAB//2": ["LOINC/2-2"],
+            "MED//A//mg": med_stem or None,
+            "MED//A//mcg": med_stem or None,
+        }
+        if with_stems:
+            codes |= {"LAB//1": ["LOINC/1-1"], "MED//A": None}
+        pl.DataFrame(
+            {"code": list(codes), "parent_codes": list(codes.values())},
+            schema={"code": pl.String, "parent_codes": pl.List(pl.String)},
+        ).write_parquet(root / "metadata" / "codes.parquet")
+        return root
+
+    cfg = ExtractConfig(min_cell_size=1, min_numeric_cell_size=1, emit_ontology_keys=True)
+    plain = extract_summary_stats(build(tmp_path / "plain", False), cfg)
+    stems = extract_summary_stats(build(tmp_path / "stems", True), cfg)
+
+    ontology = stems["code_metadata"]["ontology"]
+    assert sorted(ontology["by_vocabulary"]) == ["LOINC"]
+    assert ontology["n_vocabularies"] == 1
+    assert ontology["coverage"]["frac_measurements_mapped"] == 0.6
+    assert ontology["by_vocabulary"]["LOINC"]["keys"] == ["1-1", "2-2"]
+    assert "MED" not in json.dumps(ontology) and "LAB" not in json.dumps(ontology)
+
+    # Everything measured over the data, and every vocabulary statistic, is as without stems. The
+    # stem rows are rows of `codes.parquet`, so the metadata-side counts include them: `LAB//1`
+    # carries its siblings' LOINC parent and is one more LOINC child code.
+    def vocabulary_side(stats: dict) -> dict:
+        ontology = flatten(stats["code_metadata"]["ontology"])
+        metadata_side = (
+            "n_codes_with_parents",
+            "parents_per_code.",
+            "vocabularies_per_code.",
+            "n_parent_links",
+        )
+        return {
+            path: value
+            for path, value in ontology.items()
+            if not path.startswith(metadata_side) and not path.endswith("n_child_codes")
+        }
+
+    assert vocabulary_side(stems) == vocabulary_side(plain)
+    for block in ("counts", "codes", "per_subject", "time"):
+        assert stems[block] == plain[block], block
+    assert ontology["by_vocabulary"]["LOINC"]["n_child_codes"] == 4
+    assert plain["code_metadata"]["ontology"]["by_vocabulary"]["LOINC"]["n_child_codes"] == 3
+
+    assert stems["code_metadata"]["dataset_parents"] == {
+        "present": True,
+        "n_codes_with_dataset_parents": 4,
+        "n_parent_links": 4,
+        "n_distinct_parents": 2,
+        "n_parents_absent_from_data": 2,
+    }
+    assert plain["code_metadata"]["dataset_parents"] == {
+        "present": True,
+        "n_codes_with_dataset_parents": 0,
+        "n_parent_links": 0,
+        "n_distinct_parents": 0,
+        "n_parents_absent_from_data": 0,
+    }
+    # The stems are metadata codes without events, and are counted as such.
+    assert stems["code_metadata"]["n_codes"] == plain["code_metadata"]["n_codes"] + 2
+    assert (
+        stems["code_metadata"]["n_metadata_codes_absent_from_data"]
+        == plain["code_metadata"]["n_metadata_codes_absent_from_data"] + 2
+    )
+
+
 @pytest.mark.parametrize("parent_codes_dtype", [pl.Null, pl.List(pl.Null)], ids=["null", "list_of_null"])
 def test_null_typed_code_metadata_columns_read_like_typed_nulls(tmp_path: Path, parent_codes_dtype):
     """An all-null ``description`` or ``parent_codes`` column may be written with a null dtype.

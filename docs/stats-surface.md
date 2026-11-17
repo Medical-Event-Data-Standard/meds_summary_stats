@@ -284,6 +284,55 @@ a look too.
 the metadata vocabulary. `n_parents_without_vocabulary` counts parent codes with no `/` separator at
 all — those cannot be attributed to a terminology and are pooled rather than guessed at.
 
+### In-dataset parents
+
+Not every `parent_codes` entry names a terminology. MEDS ETLs give codes that differ only in a
+trailing unit, such as `LAB//50912//mg/dL` and `LAB//50912//mmol/L`, their stem `LAB//50912` as a
+parent, and the stem a row of its own in `codes.parquet`, with no events. Hierarchies within a
+dataset's own codes look the same. Read as a vocabulary reference, such a parent would make `LAB` a
+"vocabulary", count its children as mapped, and print a fragment of the dataset's own codes as a
+vocabulary name.
+
+So a parent that is itself a code of the same `codes.parquet` (other than the code itself) is an
+**in-dataset parent**, and the ontology block leaves it out of every figure: vocabularies, keys,
+parent links and mapping coverage. The comparison is by string identity with a code of the table,
+never by the shape of the code strings. One exception keeps OMOP-derived datasets intact, whose codes
+are themselves vocabulary concepts: a parent that names a recognized vocabulary, such as
+`SNOMED/44054006` above `ICD10CM/E11.9`, stays a reference even when it is also a code of the table.
+
+In-dataset parents are counted, never named, in `code_metadata.dataset_parents`. Here two unit
+siblings of a medication have only their stem as a parent:
+
+```python
+>>> spec = {
+...     "data": {"0.parquet": {
+...         "subject_id": [1, 1, 2, 2], "time": [None] * 4,
+...         "code": ["HR", "MED//A//mg", "MED//A//mcg", "HR"],
+...         "numeric_value": [60.0, 1.0, 2.0, 70.0]}},
+...     "metadata": {"codes.parquet": {
+...         "code": ["HR", "MED//A//mg", "MED//A//mcg", "MED//A"],
+...         "parent_codes": [["LOINC/8867-4"], ["MED//A"], ["MED//A"], None]}},
+... }
+>>> with yaml_disk(spec) as d:
+...     stems = extract_summary_stats(d, cfg)["code_metadata"]
+>>> sorted(stems["ontology"]["by_vocabulary"]), stems["ontology"]["coverage"]["frac_measurements_mapped"]
+(['LOINC'], 0.5)
+>>> stems["dataset_parents"]
+{'present': True, 'n_codes_with_dataset_parents': 2, 'n_parent_links': 2, 'n_distinct_parents': 1,
+ 'n_parents_absent_from_data': 1}
+
+```
+
+The stem row is still a row of `codes.parquet`, so it counts wherever rows of `codes.parquet`
+count: in `n_codes`, `vocabulary_digest` and the description figures, as one of the
+`n_metadata_codes_absent_from_data` (it has no events), and, through any vocabulary parents of its
+own, in `n_codes_with_parents`, `parents_per_code` and a vocabulary's `n_child_codes`. Nothing
+computed over the data changes, since it has no events. `n_parents_absent_from_data` says how many
+of the codes without events are in-dataset parents. `code_metadata.n_with_parent_codes` counts every
+non-null entry, in-dataset or not, as a description of the column itself. A dataset without
+in-dataset parents gets the same document as before, plus this block with zero counts; the default
+policy reports the block's appearance in an older baseline as `info`.
+
 Alongside all of this, `code_metadata` checks the MEDS invariant that every code in the data appears
 in `metadata/codes.parquet`:
 

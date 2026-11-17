@@ -149,7 +149,7 @@ Re-extracting the same dataset reproduces it exactly, which is the property the 
 >>> from meds_summary_stats.compare import compare_summary_stats
 >>> from meds_summary_stats.report import render_text
 >>> print(render_text(compare_summary_stats(baseline, baseline)))
-PASS - 207 paths checked, 4 ignored, no findings.
+PASS - 212 paths checked, 4 ignored, no findings.
 
 ```
 
@@ -312,7 +312,10 @@ by name, with per-vocabulary volume, subject counts, numeric moments, and key-se
 subject to suppression), plus dataset-level mapping coverage. It is the only axis that says *where*
 the vocabulary moved, and it catches a regression nothing else can: when a concept-mapping join
 silently stops resolving, every count over the data is unchanged and only
-`ontology.coverage.frac_measurements_mapped` falls.
+`ontology.coverage.frac_measurements_mapped` falls. A parent that is itself a code of the same
+`codes.parquet`, such as the stem `LAB//50912` that ETLs give the unit siblings `LAB//50912//mg/dL`
+and `LAB//50912//mmol/L`, names no terminology: it is left out of that block and only counted,
+under `code_metadata.dataset_parents`.
 
 ## How comparison works
 

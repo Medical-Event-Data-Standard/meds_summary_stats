@@ -42,7 +42,14 @@ from meds_summary_stats.extract import (
     extract_summary_stats,
 )
 from meds_summary_stats.flatten import escape, flatten, matches, specificity
-from meds_summary_stats.ontology import key_expr, split_parent_code, vocabulary_expr
+from meds_summary_stats.ontology import (
+    KNOWN_VOCABULARIES,
+    is_recognized,
+    key_expr,
+    recognized_expr,
+    split_parent_code,
+    vocabulary_expr,
+)
 
 # Codes are drawn to look like real MEDS vocabularies: some carrying the `//` convention many ETLs
 # use, some entirely flat. Nothing in the package may treat those two shapes differently -- MEDS
@@ -619,6 +626,22 @@ class TestOntologyParsers:
 
         assert vectorized["vocabulary"].to_list() == [v for v, _ in expected]
         assert vectorized["key"].to_list() == [k for _, k in expected]
+
+    @given(
+        names=st.lists(
+            st.one_of(
+                st.sampled_from(sorted(KNOWN_VOCABULARIES)).map(
+                    lambda name: name.upper() if len(name) % 2 else name.lower()
+                ),
+                st.text(string.ascii_letters + " _-<>", max_size=12),
+            ),
+            min_size=1,
+            max_size=8,
+        )
+    )
+    def test_scalar_and_vectorized_recognition_agree(self, names):
+        vectorized = pl.DataFrame({"vocabulary": names}).select(recognized_expr())["vocabulary"]
+        assert vectorized.to_list() == [is_recognized(name) for name in names]
 
     @given(parent=parent_codes)
     def test_the_split_is_lossless_up_to_separators(self, parent):
