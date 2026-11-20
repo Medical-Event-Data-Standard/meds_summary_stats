@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
@@ -466,7 +467,8 @@ class ComparePolicy:
         """Build a policy from its YAML mapping form.
 
         User rules are appended to the defaults rather than replacing them, so a config only has to
-        state its overrides. Set ``extends: none`` to start from an empty rule set instead.
+        state its overrides. Set ``extends: none`` to start from an empty rule set instead, or
+        ``extends: <name>`` to start from a built-in policy (:data:`PRESETS`).
 
         Examples:
             >>> policy = ComparePolicy.from_dict({
@@ -509,12 +511,44 @@ class ComparePolicy:
             Traceback (most recent call last):
                 ...
             ValueError: Unknown policy keys: ['typo_key']
+
+            ``extends`` may also name a built-in policy (see :data:`PRESETS`). Its settings and rules
+            come first, so the file's own settings and rules override them:
+
+            >>> etl = ComparePolicy.from_dict({"extends": "etl-regression"})
+            >>> etl.on_dataset_version_change, etl.rule_for("code_metadata.n_codes").kind
+            (<DatasetVersionChangeAction.IGNORE: 'ignore'>, <Kind.EXACT: 'exact'>)
+            >>> tweaked = ComparePolicy.from_dict({
+            ...     "extends": "etl-regression",
+            ...     "on_dataset_version_change": "warn",
+            ...     "rules": [{"path": "splits.**", "kind": "exact", "on_change": "warning"}],
+            ... })
+            >>> tweaked.on_dataset_version_change, tweaked.rule_for("splits.n_train").on_change
+            (<DatasetVersionChangeAction.WARN: 'warn'>, <Severity.WARNING: 'warning'>)
+
+            Anything else is a mistake, not a silent fallback to the defaults:
+
+            >>> ComparePolicy.from_dict({"extends": "etl_regression"})
+            Traceback (most recent call last):
+                ...
+            ValueError: Unknown policy 'extends: etl_regression'; expected 'default', 'none' or one of
+            ['etl-regression']
         """
         known = {"extends", "rules", "on_added_key", "on_removed_key", "on_dataset_version_change", "fail_on"}
         if unknown := sorted(set(raw) - known):
             raise ValueError(f"Unknown policy keys: {unknown}")
 
-        base = () if raw.get("extends") == "none" else tuple(Rule.from_dict(r) for r in DEFAULT_RULES)
+        extends = raw.get("extends", "default")
+        if extends in PRESETS:
+            preset = _preset_dict(extends)
+            raw = {**preset, **raw, "rules": [*preset.get("rules", []), *raw.get("rules", [])]}
+            extends = preset.get("extends", "default")
+        if extends not in ("default", "none"):
+            raise ValueError(
+                f"Unknown policy 'extends: {extends}'; expected 'default', 'none' or one of {sorted(PRESETS)}"
+            )
+
+        base = () if extends == "none" else tuple(Rule.from_dict(r) for r in DEFAULT_RULES)
         user = tuple(Rule.from_dict(r) for r in raw.get("rules", []))
         return cls(
             rules=base + user,
@@ -541,3 +575,51 @@ class ComparePolicy:
             (<DatasetVersionChangeAction.RELAX: 'relax'>, 0.2)
         """
         return cls.from_dict(yaml.safe_load(Path(path).read_text()) or {})
+
+    @classmethod
+    def load(cls, spec: str | Path) -> ComparePolicy:
+        """Load a policy file, or a built-in policy by name.
+
+        A name in :data:`PRESETS` is the built-in policy unless a file of that name exists, so a
+        repository can still keep a file called ``etl-regression`` in its working directory.
+
+        Examples:
+            >>> ComparePolicy.load("etl-regression") == ComparePolicy.from_dict({"extends": "etl-regression"})
+            True
+            >>> with yaml_disk({"p.yaml": {"fail_on": "warning"}}) as root:
+            ...     ComparePolicy.load(root / "p.yaml").fail_on
+            <Severity.WARNING: 'warning'>
+            >>> ComparePolicy.load("no/such/policy.yaml")
+            Traceback (most recent call last):
+                ...
+            FileNotFoundError: No policy file at no/such/policy.yaml, and it is not the name of a built-in
+            policy (['etl-regression'])
+        """
+        if str(spec) in PRESETS and not Path(spec).exists():
+            return cls.from_dict({"extends": str(spec)})
+        if not Path(spec).is_file():
+            raise FileNotFoundError(
+                f"No policy file at {spec}, and it is not the name of a built-in policy ({sorted(PRESETS)})"
+            )
+        return cls.from_yaml(spec)
+
+
+#: Built-in policies, by name, shipped as YAML files in ``meds_summary_stats/policies/``. Use one by
+#: name wherever a policy file is accepted, or extend it with ``extends: <name>`` in your own file.
+#:
+#: * ``etl-regression``: for baselines an ETL repository commits next to its code and rebuilds from
+#:   the same pinned source release. The dataset's content (counts, the code vocabulary, metadata
+#:   coverage, splits) must not move at all, byte-level digests only warn, and provenance that changes
+#:   on every run is ignored. ``baseline_MEDS_summary_stats`` uses it by default.
+PRESETS: tuple[str, ...] = ("etl-regression",)
+
+
+def _preset_dict(name: str) -> dict[str, Any]:
+    """Read a built-in policy's YAML mapping.
+
+    Examples:
+        >>> preset = _preset_dict("etl-regression")
+        >>> preset["fail_on"], len(preset["rules"]) > 10
+        ('error', True)
+    """
+    return yaml.safe_load(files(__package__).joinpath("policies", f"{name}.yaml").read_text()) or {}

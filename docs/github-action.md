@@ -11,6 +11,10 @@ on "the summary statistics have not moved". Two ways to consume it:
 
 Both write a markdown report to the job summary and upload the stats and report as artifacts.
 
+For a baseline CI cannot rebuild (a credentialed release), the `baseline-freshness` action
+(`Medical-Event-Data-Standard/meds_summary_stats/baseline-freshness@v0`) warns when a pull request
+changes the ETL but not the baseline; see [`etl-baselines.md`](etl-baselines.md).
+
 > [!IMPORTANT]
 > The action runs wherever your data already is. It does not fetch, upload, or transmit the dataset.
 > The only thing it produces is the aggregated fingerprint described in

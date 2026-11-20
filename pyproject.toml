@@ -44,6 +44,7 @@ docs = []
 [project.scripts]
 extract_MEDS_summary_stats = "meds_summary_stats.cli:extract_main"
 compare_MEDS_summary_stats = "meds_summary_stats.cli:compare_main"
+baseline_MEDS_summary_stats = "meds_summary_stats.baseline:baseline_main"
 
 [tool.pytest.ini_options] # Default pytest options
 addopts = [

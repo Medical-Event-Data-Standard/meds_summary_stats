@@ -1,11 +1,13 @@
 """Command-line entry points.
 
-Two commands, registered as console scripts in ``pyproject.toml``:
+Three commands, registered as console scripts in ``pyproject.toml``:
 
 * ``extract_MEDS_summary_stats`` / ``python -m meds_summary_stats extract``
 * ``compare_MEDS_summary_stats`` / ``python -m meds_summary_stats compare``
+* ``baseline_MEDS_summary_stats`` / ``python -m meds_summary_stats baseline``, which lives in
+  :mod:`meds_summary_stats.baseline`
 
-Both ``main`` functions take an explicit argument list and return an exit code rather than calling
+All ``main`` functions take an explicit argument list and return an exit code rather than calling
 ``sys.exit``, which is what lets the whole CLI surface be exercised from doctests.
 """
 
@@ -28,7 +30,7 @@ from .extract import (
     read_summary_stats,
     write_summary_stats,
 )
-from .policy import ComparePolicy, Severity  # noqa: F401  (Severity used in doctests)
+from .policy import PRESETS, ComparePolicy, Severity  # noqa: F401  (Severity used in doctests)
 from .report import render_markdown, render_text
 
 #: Exit code for a comparison that failed its policy. Distinct from ``2``, which argparse uses for
@@ -228,7 +230,13 @@ def _compare_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("baseline", type=Path, help="The reference (known-good) stats file.")
     parser.add_argument("current", type=Path, help="The stats file under test.")
-    parser.add_argument("-c", "--config", type=Path, default=None, help="YAML comparison policy.")
+    parser.add_argument(
+        "-c",
+        "--config",
+        type=Path,
+        default=None,
+        help=f"YAML comparison policy, or the name of a built-in one ({', '.join(PRESETS)}).",
+    )
     parser.add_argument("-o", "--output", type=Path, default=None, help="Where to write the JSON report.")
     parser.add_argument(
         "--markdown", type=Path, default=None, help="Where to write a markdown report for a CI summary."
@@ -285,9 +293,17 @@ def _resolve_policy(args: argparse.Namespace) -> ComparePolicy:
         (<Severity.WARNING: 'warning'>, 0.3)
         >>> overridden.fail_on
         <Severity.ERROR: 'error'>
+
+        ``--config`` also takes the name of a built-in policy, and flags override it too:
+
+        >>> etl = _resolve_policy(parser.parse_args(["a", "b", "-c", "etl-regression", "--fail-on", "never"]))
+        >>> etl.on_dataset_version_change, etl.fail_on
+        (<DatasetVersionChangeAction.IGNORE: 'ignore'>, None)
     """
     raw: dict[str, object] = {}
-    if args.config:
+    if args.config and str(args.config) in PRESETS and not Path(args.config).exists():
+        raw = {"extends": str(args.config)}
+    elif args.config:
         raw = yaml.safe_load(Path(args.config).read_text()) or {}
     if args.fail_on is not None:
         raw["fail_on"] = args.fail_on
@@ -446,7 +462,7 @@ def _write_github_outputs(report: ComparisonReport) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Dispatch ``python -m meds_summary_stats <extract|compare> ...``.
+    """Dispatch ``python -m meds_summary_stats <extract|compare|baseline> ...``.
 
     Args:
         argv: Arguments excluding the program name.
@@ -456,15 +472,22 @@ def main(argv: list[str] | None = None) -> int:
 
     Examples:
         >>> main([])
-        usage: python -m meds_summary_stats {extract,compare} ...
+        usage: python -m meds_summary_stats {extract,compare,baseline} ...
         2
         >>> main(["frobnicate"])
-        usage: python -m meds_summary_stats {extract,compare} ...
+        usage: python -m meds_summary_stats {extract,compare,baseline} ...
         2
+        >>> import contextlib, io
+        >>> with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(io.StringIO()):
+        ...     main(["baseline", "full", "--project", tmp])
+        3
     """
+    from .baseline import baseline_main
+
+    commands = {"extract": extract_main, "compare": compare_main, "baseline": baseline_main}
     argv = list(sys.argv[1:] if argv is None else argv)
-    if not argv or argv[0] not in ("extract", "compare"):
-        print("usage: python -m meds_summary_stats {extract,compare} ...")
+    if not argv or argv[0] not in commands:
+        print("usage: python -m meds_summary_stats {extract,compare,baseline} ...")
         return 2
     command, *rest = argv
-    return extract_main(rest) if command == "extract" else compare_main(rest)
+    return commands[command](rest)
