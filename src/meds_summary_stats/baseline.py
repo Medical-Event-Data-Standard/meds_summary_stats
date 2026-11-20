@@ -85,6 +85,18 @@ class Kind:
             ...
         meds_summary_stats.baseline.BaselineError: kinds.demo: unknown key(s) ['bulid_without_input'];
         expected ['build', 'build_without_input']
+        >>> Kind.from_dict("demo", "etl {output_dir}")
+        Traceback (most recent call last):
+            ...
+        meds_summary_stats.baseline.BaselineError: kinds.demo must be a table with a 'build' command
+        >>> Kind.from_dict("demo", {"build": " "})
+        Traceback (most recent call last):
+            ...
+        meds_summary_stats.baseline.BaselineError: kinds.demo.build must be a non-empty command string
+        >>> Kind.from_dict("demo", {"build_without_input": "etl {output_dir}"})
+        Traceback (most recent call last):
+            ...
+        meds_summary_stats.baseline.BaselineError: kinds.demo needs a 'build' command
         >>> Kind.from_dict("demo", {"build": "etl {input_dir}"})
         Traceback (most recent call last):
             ...
@@ -202,6 +214,30 @@ class BaselineSettings:
             ...
         meds_summary_stats.baseline.BaselineError: [tool.meds_summary_stats.baselines]: unknown key(s)
         ['kind']; expected ['directory', 'kinds', 'policy', 'require_dataset_metadata']
+        >>> def settings_from(toml):
+        ...     with tempfile.TemporaryDirectory() as d:
+        ...         _ = (Path(d) / "pyproject.toml").write_text(toml)
+        ...         return BaselineSettings.from_project(Path(d))
+        >>> settings_from("[tool.meds_summary_stats.baselines]")
+        Traceback (most recent call last):
+            ...
+        meds_summary_stats.baseline.BaselineError: [tool.meds_summary_stats.baselines] needs at least one
+        kinds.<name> table
+        >>> settings_from('''
+        ... [tool.meds_summary_stats.baselines]
+        ... require_dataset_metadata = ["sumeds_enrichment.enriched"]
+        ... [tool.meds_summary_stats.baselines.kinds.full]
+        ... build = "etl {output_dir}"
+        ... ''')
+        Traceback (most recent call last):
+            ...
+        meds_summary_stats.baseline.BaselineError: require_dataset_metadata must map dotted dataset.json
+        paths to values
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     BaselineSettings.from_project(Path(d))
+        Traceback (most recent call last):
+            ...
+        meds_summary_stats.baseline.BaselineError: no pyproject.toml in ...; pass --project
     """
 
     project_dir: Path
@@ -343,7 +379,23 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _default_output_dir(settings: BaselineSettings, kind: str) -> Path:
-    """``<tmp>/<project>-<kind>-<short commit>``, or without the commit outside a git checkout."""
+    """``<tmp>/<project>-<kind>-<short commit>``, or without the commit outside a git checkout.
+
+    Examples:
+        >>> import subprocess
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     repo = Path(d) / "MY_ETL"
+        ...     repo.mkdir()
+        ...     outside = _default_output_dir(BaselineSettings(repo, {}), "full")
+        ...     _ = subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        ...     _ = subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@e.org", "commit",
+        ...                         "-q", "--allow-empty", "-m", "x"], cwd=repo, check=True)
+        ...     inside = _default_output_dir(BaselineSettings(repo, {}), "full")
+        >>> outside.name, outside.parent == Path(tempfile.gettempdir())
+        ('MY_ETL-full', True)
+        >>> inside.name.startswith("MY_ETL-full-"), len(inside.name) > len("MY_ETL-full-")
+        (True, True)
+    """
     try:
         commit = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
@@ -412,12 +464,23 @@ def baseline_main(argv: list[str] | None = None) -> int:
         ... build_without_input = "cp -R {simple_static_MEDS} {{output_dir}}"
         ... ''')
 
-        The first run builds the dataset and writes the baseline:
+        There is nothing to compare with yet:
 
-        >>> code, out, err = run("demo", "--output-dir", str(Path(tmp.name) / "build1"))
-        >>> code, (project / "tests/regression/demo_summary_stats.json").is_file()
-        (0, True)
-        >>> print(err.splitlines()[-1])
+        >>> code, out, err = run("demo", "--compare", "--meds-dir", str(simple_static_MEDS))
+        >>> code, err.strip().endswith("demo_summary_stats.json")
+        (3, True)
+
+        The first run builds the dataset and writes the baseline. The build's output goes to stderr,
+        streamed when stderr is a file:
+
+        >>> log = Path(tmp.name) / "build.log"
+        >>> with log.open("w") as f, contextlib.redirect_stderr(f):
+        ...     baseline_main(["demo", "--output-dir", str(Path(tmp.name) / "build1"),
+        ...                    "--project", str(project)])
+        0
+        >>> (project / "tests/regression/demo_summary_stats.json").is_file()
+        True
+        >>> print(log.read_text().splitlines()[-1])
         Wrote tests/regression/demo_summary_stats.json
 
         ``--compare`` checks a build against it and writes nothing:
@@ -442,6 +505,13 @@ def baseline_main(argv: list[str] | None = None) -> int:
         (0, True, 'Wrote tests/regression/demo_summary_stats.json')
         >>> run("demo", "--compare", "--meds-dir", str(changed))[0]
         0
+
+        An unreadable baseline is not overwritten:
+
+        >>> baseline = project / "tests/regression/demo_summary_stats.json"
+        >>> _ = baseline.write_text("not json")
+        >>> run("demo", "--meds-dir", str(changed))[0], baseline.read_text()
+        (3, 'not json')
 
         Mistakes are reported as messages with the input-error code:
 
