@@ -26,7 +26,7 @@ import polars as pl
 from . import __version__
 from .config import NO_VOCABULARY, SUPPRESSED, ExtractConfig
 from .digests import combine_digests, digest, file_digest, format_moment, ordered_by
-from .ontology import is_recognized, key_expr, vocabulary_expr
+from .ontology import is_recognized, key_expr, recognized_expr, vocabulary_expr
 
 #: Version of the emitted stats document format.
 #:
@@ -863,8 +863,80 @@ def _scan_code_metadata(fp: Path) -> pl.LazyFrame:
     return lf.with_columns(pl.col(name).cast(_CODE_METADATA_DTYPES[name]) for name in null_typed)
 
 
+def _parent_links(lf: pl.LazyFrame) -> pl.LazyFrame:
+    """One row per ``parent_codes`` entry, with its vocabulary and key, and whether it is in-dataset.
+
+    An **in-dataset parent** is an entry that is itself a code of the same ``codes.parquet``, other
+    than the code itself, and that names no recognized vocabulary (see
+    :func:`~meds_summary_stats.ontology.is_recognized`). MEDS ETLs add them for unit siblings: the
+    stem ``LAB//50912`` is a parent of ``LAB//50912//mg/dL`` and ``LAB//50912//mmol/L``, and gets a
+    row of its own. Such a parent names another code of the dataset, not a concept of a published
+    terminology, so it is not a vocabulary reference: reading its prefix as one would invent a
+    vocabulary ``LAB``, count its children as mapped, and print a fragment of the dataset's own codes
+    as a vocabulary name.
+
+    A parent that is a code of the table *and* names a recognized vocabulary stays a reference. In
+    OMOP-derived datasets the codes are themselves vocabulary concepts, and ``SNOMED/44054006`` can be
+    both a code and the parent of ``ICD10CM/E11.9``; it still names a SNOMED concept. The test is by
+    string identity with a code of the table, never by the shape of the code strings.
+
+    Args:
+        lf: The code metadata, with a ``parent_codes`` column.
+
+    Returns:
+        A lazy frame with ``row`` (the metadata row), ``code``, ``parent_code``, ``vocabulary``,
+        ``key`` and ``in_dataset``. Null entries are dropped.
+
+    Examples:
+        >>> lf = pl.LazyFrame({
+        ...     "code": ["LAB//1//mg", "LAB//1//mcg", "LAB//1", "ICD10CM/E11.9", "SNOMED/44054006", "X"],
+        ...     "parent_codes": [["LOINC/1-1", "LAB//1"], ["LOINC/1-1", "LAB//1"], ["LOINC/1-1"],
+        ...                      ["SNOMED/44054006", None], [], ["X"]],
+        ... })
+        >>> for row in _parent_links(lf).select("code", "parent_code", "in_dataset").collect().rows():
+        ...     print(row)
+        ('LAB//1//mg', 'LOINC/1-1', False)
+        ('LAB//1//mg', 'LAB//1', True)
+        ('LAB//1//mcg', 'LOINC/1-1', False)
+        ('LAB//1//mcg', 'LAB//1', True)
+        ('LAB//1', 'LOINC/1-1', False)
+        ('ICD10CM/E11.9', 'SNOMED/44054006', False)
+        ('X', 'X', False)
+
+        ``SNOMED/44054006`` is a code of the table but names a recognized vocabulary, so it stays a
+        reference; ``X``, a code listing itself, names no other code.
+    """
+    in_table = lf.select(parent_code=pl.col("code").cast(pl.String)).drop_nulls().unique()
+    return (
+        lf.select("code", "parent_codes")
+        .with_row_index("row")
+        .explode("parent_codes", empty_as_null=True)
+        .drop_nulls("parent_codes")
+        .rename({"parent_codes": "parent_code"})
+        .join(
+            in_table.with_columns(_in_table=pl.lit(True)), on="parent_code", how="left", maintain_order="left"
+        )
+        .with_columns(vocabulary_expr(), key_expr())
+        .select(
+            "row",
+            "code",
+            "parent_code",
+            "vocabulary",
+            "key",
+            in_dataset=(
+                pl.col("_in_table").fill_null(False)
+                & (pl.col("parent_code") != pl.col("code").cast(pl.String))
+                & ~recognized_expr("vocabulary")
+            ),
+        )
+    )
+
+
 def _code_vocabulary_map(meds_dir: Path) -> pl.LazyFrame | None:
     """Build the distinct ``(code, vocabulary)`` mapping implied by ``parent_codes``.
+
+    In-dataset parents (see :func:`_parent_links`) are left out: they name codes of the dataset, not
+    vocabularies, so a code whose only parents are in-dataset is unmapped.
 
     Args:
         meds_dir: The MEDS dataset root.
@@ -901,6 +973,18 @@ def _code_vocabulary_map(meds_dir: Path) -> pl.LazyFrame | None:
         >>> with yaml_disk({"metadata": {"codes.parquet": {"code": ["HR"]}}}) as d:
         ...     _code_vocabulary_map(d) is None
         True
+
+        The unit siblings ``MED//A//mg`` and ``MED//A//mcg`` have only their stem ``MED//A``, a
+        code of the same table, as a parent. That maps them into no vocabulary, so there is no
+        vocabulary ``MED``:
+
+        >>> spec = {"metadata": {"codes.parquet": {
+        ...     "code": ["MED//A//mg", "MED//A//mcg", "MED//A", "HR"],
+        ...     "parent_codes": [["MED//A"], ["MED//A"], None, ["LOINC/8867-4"]],
+        ... }}}
+        >>> with yaml_disk(spec) as d:
+        ...     _code_vocabulary_map(d).collect().to_dicts()
+        [{'code': 'HR', 'vocabulary': 'LOINC'}]
     """
     fp = meds_dir / meds.code_metadata_filepath
     if not fp.is_file():
@@ -908,14 +992,7 @@ def _code_vocabulary_map(meds_dir: Path) -> pl.LazyFrame | None:
     lf = _scan_code_metadata(fp)
     if "parent_codes" not in lf.collect_schema():
         return None
-    return (
-        lf.select("code", "parent_codes")
-        .explode("parent_codes", empty_as_null=True)
-        .drop_nulls("parent_codes")
-        .rename({"parent_codes": "parent_code"})
-        .select("code", vocabulary_expr())
-        .unique()
-    )
+    return _parent_links(lf).filter(~pl.col("in_dataset")).select("code", "vocabulary").unique()
 
 
 def _subject_filters(counts: pl.DataFrame, max_rows: int) -> list[pl.Expr]:
@@ -1521,6 +1598,9 @@ def _ontology_block(
 ) -> dict[str, Any]:
     """Summarize the external ontologies that ``parent_codes`` links into.
 
+    In-dataset parents (see :func:`_parent_links`) are not links into an ontology, so every figure
+    here leaves them out; :func:`_dataset_parents_block` counts them.
+
     This is the only axis along which the vocabulary is partitioned, and the reason it is the only
     one: ``parent_codes`` entries name concepts in *published* terminologies -- LOINC, SNOMED, ICD --
     so the grouping is declared by the dataset rather than guessed from the shape of its code
@@ -1632,6 +1712,21 @@ def _ontology_block(
         ...                             ExtractConfig(min_cell_size=20, emit_ontology_keys=True))
         >>> keyed["by_vocabulary"]["LOINC"]["keys"]
         ['8310-5', '8867-4']
+
+        An in-dataset parent, here the stem ``MED//A`` of two unit siblings, is no vocabulary, adds
+        no parent link, and maps nothing:
+
+        >>> spec = {"metadata": {"codes.parquet": {
+        ...     "code": ["HR", "MED//A//mg", "MED//A//mcg", "MED//A"],
+        ...     "parent_codes": [["LOINC/8867-4"], ["MED//A"], ["MED//A"], None],
+        ... }}}
+        >>> with yaml_disk(spec) as d:
+        ...     block = _ontology_block(d, volumes, pl.DataFrame([{"n_measurements": 300}]),
+        ...                             {"HR", "MED//A//mg", "MED//A//mcg"}, 800, ExtractConfig())
+        >>> block["n_vocabularies"], block["n_parent_links"], block["n_codes_with_parents"]
+        (1, 1, 1)
+        >>> block["coverage"]["n_observed_codes_with_parents"], block["coverage"]["frac_measurements_mapped"]
+        (1, 0.625)
     """
     fp = meds_dir / meds.code_metadata_filepath
     if not fp.is_file():
@@ -1640,19 +1735,17 @@ def _ontology_block(
     if "parent_codes" not in lf.collect_schema():
         return {"present": False}
 
-    # `drop_nulls` matches what `links` below does after exploding, so `n_codes_with_parents` and
-    # `parents_per_code` count the same parents the per-vocabulary breakdown does. Without it a
-    # `[null]` entry counts as one parent that belongs to no vocabulary.
-    per_code_parents = lf.select(
-        "code", n_parents=pl.col("parent_codes").list.drop_nulls().list.len().fill_null(0)
-    ).collect()
-    links = (
-        lf.select("code", "parent_codes")
-        .explode("parent_codes", empty_as_null=True)
-        .drop_nulls("parent_codes")
-        .rename({"parent_codes": "parent_code"})
-        .select("code", "parent_code", vocabulary_expr(), key_expr())
+    # Every count here is over vocabulary references only: in-dataset parents name codes of the
+    # dataset, not vocabularies, and `_dataset_parents_block` reports them. `links` has no null
+    # entries, so `n_codes_with_parents` and `parents_per_code` count the same parents the
+    # per-vocabulary breakdown does; a `[null]` entry is not a parent that belongs to no vocabulary.
+    links = _parent_links(lf).filter(~pl.col("in_dataset")).drop("in_dataset").collect()
+    per_code_parents = (
+        lf.select("code")
+        .with_row_index("row")
         .collect()
+        .join(links.group_by("row").agg(n_parents=pl.len()), on="row", how="left")
+        .select("code", n_parents=pl.col("n_parents").fill_null(0))
     )
     per_code_vocabularies = links.group_by("code").agg(n_vocabularies=pl.col("vocabulary").n_unique())
 
@@ -1726,6 +1819,67 @@ def _ontology_block(
     }
 
 
+def _dataset_parents_block(meds_dir: Path, observed_codes: set[str]) -> dict[str, Any]:
+    """Count the in-dataset parents of ``parent_codes``, which the ontology block leaves out.
+
+    See :func:`_parent_links` for what an in-dataset parent is. Only counts are reported: the
+    parents are codes of the dataset, so none of them is ever named.
+
+    Args:
+        meds_dir: The MEDS dataset root.
+        observed_codes: Codes actually present in the data.
+
+    Returns:
+        The ``dataset_parents`` sub-block, or ``{"present": False}`` when there is no code metadata
+        with a ``parent_codes`` column.
+
+    Examples:
+        Two unit siblings get their stem as a parent, and the stem a row with no events of its own:
+
+        >>> from pprint import pprint
+        >>> spec = {"metadata": {"codes.parquet": {
+        ...     "code": ["HR", "MED//A//mg", "MED//A//mcg", "MED//A"],
+        ...     "parent_codes": [["LOINC/8867-4"], ["MED//A"], ["MED//A"], None],
+        ... }}}
+        >>> with yaml_disk(spec) as d:
+        ...     pprint(_dataset_parents_block(d, {"HR", "MED//A//mg", "MED//A//mcg"}))
+        {'n_codes_with_dataset_parents': 2,
+         'n_distinct_parents': 1,
+         'n_parent_links': 2,
+         'n_parents_absent_from_data': 1,
+         'present': True}
+
+        Without in-dataset parents every count is zero:
+
+        >>> spec = {"metadata": {"codes.parquet": {"code": ["HR"], "parent_codes": [["LOINC/8867-4"]]}}}
+        >>> with yaml_disk(spec) as d:
+        ...     _dataset_parents_block(d, {"HR"})["n_parent_links"]
+        0
+        >>> with yaml_disk({"metadata": {"codes.parquet": {"code": ["HR"]}}}) as d:
+        ...     _dataset_parents_block(d, {"HR"})
+        {'present': False}
+        >>> with yaml_disk({"data": {}}) as d:
+        ...     _dataset_parents_block(d, set())
+        {'present': False}
+    """
+    fp = meds_dir / meds.code_metadata_filepath
+    if not fp.is_file():
+        return {"present": False}
+    lf = _scan_code_metadata(fp)
+    if "parent_codes" not in lf.collect_schema():
+        return {"present": False}
+
+    links = _parent_links(lf).filter(pl.col("in_dataset")).select("row", "parent_code").collect()
+    parents = set(links["parent_code"].to_list())
+    return {
+        "present": True,
+        "n_codes_with_dataset_parents": links["row"].n_unique(),
+        "n_parent_links": links.height,
+        "n_distinct_parents": len(parents),
+        "n_parents_absent_from_data": len(parents - observed_codes),
+    }
+
+
 def _code_metadata_block(
     meds_dir: Path,
     per_code: pl.DataFrame,
@@ -1752,7 +1906,8 @@ def _code_metadata_block(
         >>> observed = pl.DataFrame({"code": ["HR", "GLU", "NOT_IN_METADATA"]})
         >>> with yaml_disk(spec) as d:
         ...     block = _code_metadata_block(d, observed, None, None, None, ExtractConfig())
-        >>> pprint({k: v for k, v in block.items() if k not in ("ontology", "description_length")})
+        >>> pprint({k: v for k, v in block.items()
+        ...         if k not in ("ontology", "dataset_parents", "description_length")})
         {'n_codes': 3,
          'n_data_codes_missing_from_metadata': 1,
          'n_metadata_codes_absent_from_data': 1,
@@ -1806,8 +1961,8 @@ def _code_metadata_block(
         # `drop_nulls` before measuring length: a `parent_codes` value of `[null]` is a non-empty
         # list carrying no parent, and ETLs do emit them. Counting it as coverage inverts the
         # comparison -- an ETL that stops emitting null-filled lists then looks like it *lost*
-        # ontology mappings. This also makes the count agree with `_ontology_block`, which has
-        # always dropped nulls after exploding the same column.
+        # ontology mappings. In-dataset parents do count here, since this describes the column;
+        # `ontology.n_codes_with_parents` leaves them out, and `dataset_parents` counts them.
         "n_with_parent_codes": (
             int(
                 lf.select((pl.col("parent_codes").list.drop_nulls().list.len().fill_null(0) > 0).sum())
@@ -1827,6 +1982,7 @@ def _code_metadata_block(
     block["ontology"] = _ontology_block(
         meds_dir, by_vocabulary, unmapped, observed_codes, n_total_measurements, cfg
     )
+    block["dataset_parents"] = _dataset_parents_block(meds_dir, observed_codes)
     return block
 
 

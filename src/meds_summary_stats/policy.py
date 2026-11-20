@@ -362,6 +362,15 @@ DEFAULT_RULES: tuple[dict[str, Any], ...] = (
         "error": 0.05,
     },
     {"path": "code_metadata.ontology.n_vocabularies", "kind": "exact"},
+    # In-dataset parents, which the ontology block leaves out. Checked like any other count, but a
+    # baseline extracted before they were counted lacks the block, and that is only worth a note.
+    {
+        "path": "code_metadata.dataset_parents.**",
+        "kind": "relative",
+        "warn": 0.001,
+        "error": 0.01,
+        "on_added": "info",
+    },
     # Referential integrity between the data and its metadata.
     {"path": "code_metadata.n_data_codes_missing_from_metadata", "kind": "absolute", "error": 0},
     {"path": "splits.n_subjects_in_data_without_split", "kind": "absolute", "error": 0},

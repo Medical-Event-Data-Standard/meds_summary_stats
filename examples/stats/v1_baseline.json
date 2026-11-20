@@ -1,5 +1,12 @@
 {
   "code_metadata": {
+    "dataset_parents": {
+      "n_codes_with_dataset_parents": 0,
+      "n_distinct_parents": 0,
+      "n_parent_links": 0,
+      "n_parents_absent_from_data": 0,
+      "present": true
+    },
     "description_length": {
       "n": 10,
       "suppressed": true
