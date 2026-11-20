@@ -35,6 +35,16 @@ compare_MEDS_summary_stats baseline.json current.json
 Both are also `python -m meds_summary_stats extract` / `... compare`, and both are importable
 (`extract_summary_stats`, `compare_summary_stats`).
 
+An ETL repository that commits its baselines next to its code can let a third command do the whole
+round trip — build with the repository's own command, extract, show what moved, and update or check
+the baseline — configured in its `pyproject.toml`, with a built-in `etl-regression` policy and an
+action that reminds pull requests to regenerate a credentialed baseline. See
+[**`docs/etl-baselines.md`**](docs/etl-baselines.md):
+
+```bash
+uvx --from meds_summary_stats baseline_MEDS_summary_stats full --input-dir "$RAW_INPUT_DIR"
+```
+
 ## A worked example
 
 Three complete MEDS datasets are committed under [`examples/datasets/`](examples/datasets), so
@@ -338,7 +348,9 @@ rules:
   - {path: time.by_year.*.n_measurements, kind: relative, error: 0.05}
 ```
 
-See [`examples/policy.yaml`](examples/policy.yaml) for a fully commented one.
+See [`examples/policy.yaml`](examples/policy.yaml) for a fully commented one. `--config` also takes
+the name of a built-in policy, and `extends: <name>` builds on one; `etl-regression` is the policy for
+baselines an ETL rebuilds from the same pinned release ([`docs/etl-baselines.md`](docs/etl-baselines.md)).
 
 ### `on_dataset_version_change: relax`
 

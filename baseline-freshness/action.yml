@@ -1,0 +1,54 @@
+name: MEDS summary-stats baseline freshness
+description: >-
+  Warn when a pull request changes an ETL but not the summary-stats baselines that CI cannot rebuild
+  (a credentialed release), so the author regenerates them with baseline_MEDS_summary_stats.
+author: Medical Event Data Standard
+branding:
+  icon: clock
+  color: blue
+
+# Needs the checkout and the base commit: `actions/checkout` with `fetch-depth: 2` on a pull_request
+# event, whose checkout is a merge commit with the base branch as its first parent.
+
+inputs:
+  baselines:
+    description: Baseline files, one per line, that a change to the ETL must regenerate.
+    required: false
+    default: tests/regression/full_summary_stats.json
+  watch:
+    description: Extended regex of the paths whose changes can move the ETL's output.
+    required: false
+    default: ^src/
+  ignore:
+    description: Extended regex of the paths among those that cannot (documentation).
+    required: false
+    default: \.md$
+  base-ref:
+    description: The commit to diff against. The default is the base of a pull_request merge commit.
+    required: false
+    default: HEAD^1
+  regenerate-command:
+    description: The command the job summary shows for regenerating a baseline.
+    required: false
+    default: baseline_MEDS_summary_stats full --input-dir "$RAW_INPUT_DIR"
+
+outputs:
+  stale:
+    description: The baselines the pull request did not regenerate although the ETL changed, space-separated.
+    value: ${{ steps.check.outputs.stale }}
+
+runs:
+  using: composite
+  steps:
+    # Inputs reach the shell through `env:`, never `${{ }}` interpolation, so a value containing shell
+    # metacharacters is data, not code (zizmor enforces this).
+    - name: Check that ETL changes regenerated the baselines
+      id: check
+      shell: bash
+      env:
+        BASELINES: ${{ inputs.baselines }}
+        WATCH: ${{ inputs.watch }}
+        IGNORE: ${{ inputs.ignore }}
+        BASE_REF: ${{ inputs.base-ref }}
+        REGENERATE_COMMAND: ${{ inputs.regenerate-command }}
+      run: "$GITHUB_ACTION_PATH/check.sh"
